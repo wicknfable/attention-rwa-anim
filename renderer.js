@@ -217,15 +217,17 @@ export class Renderer {
 
     // Reusable scratch buffers — avoid per-frame GC in the hot path.
     this._footprints = [];
-    this._projectedEdges = [];
-    this._farEdges = [];
-    this._nearEdges = [];
-    this._farNodes = [];
-    this._nearNodes = [];
     this._sortedSurfaces = [];
     this._occluders = [];
-    this._ptA = { x: 0, y: 0 };
-    this._ptB = { x: 0, y: 0 };
+    this._bandBuckets = null;
+    this._bandStyles = null;
+
+    // Offscreen lattice layer — redrawn only when occlusion set changes.
+    /** @type {import('p5').Graphics | null} */
+    this._latticeGfx = null;
+    this._latticeGfxKey = '';
+    this._latticeGfxW = 0;
+    this._latticeGfxH = 0;
   }
 
   /** Clears the canvas to the background colour. */
@@ -235,101 +237,99 @@ export class Renderer {
   }
 
   /**
-   * Renders one frame of the lattice.
+   * Draws the inactive lattice from a pre-projected screen-space cache.
+   * Rasterized once per resize into an offscreen buffer, then blitted.
+   * Fully expanded platforms paint opaque footprints on top, so we do not
+   * rebuild this layer when occlusion changes (that was causing hitch spikes).
    *
-   * @param {Camera} camera
-   * @param {{nodes: Array, edges: Array}} latticeData
-   * @param {{ occludedEdgeKeys?: Set<string>, partialSurfaces?: Array }} [occlusion]
+   * @param {{ edges: Array, nodes: Array, bandCount: number }} screenLattice
+   * @param {{ occludedEdgeKeys?: Set<string> }} [_occlusion]  unused — kept for API compat
    */
-  render(camera, latticeData, occlusion = {}) {
-    const viewportHeight = camera.viewportHeight;
-    const occluded = occlusion.occludedEdgeKeys || EMPTY_SET;
-    const partialSurfaces = occlusion.partialSurfaces || EMPTY_ARR;
+  renderScreenLattice(screenLattice, _occlusion = {}) {
+    const w = this.p.width;
+    const h = this.p.height;
+    const cacheKey = `${w}x${h}|${screenLattice.edges.length}|${screenLattice.bandCount}`;
+
+    if (
+      !this._latticeGfx ||
+      this._latticeGfxW !== w ||
+      this._latticeGfxH !== h ||
+      this._latticeGfxKey !== cacheKey
+    ) {
+      this._rebuildLatticeLayer(screenLattice, w, h, cacheKey);
+    }
 
     this.clearBackground();
+    this.p.image(this._latticeGfx, 0, 0);
+  }
 
-    // Fast path: fully expanded cells hide their four boundary edges via
-    // an O(1) Set lookup. Expensive polygon clipping runs only for the few
-    // cells still scaling in (partialSurfaces) — not for every extrusion.
-    const partialFootprints = this._buildExtrusionFootprints(partialSurfaces);
+  /** Rasterizes the inactive lattice into `_latticeGfx` (resize / first frame only). */
+  _rebuildLatticeLayer(screenLattice, w, h, cacheKey) {
+    if (!this._latticeGfx || this._latticeGfxW !== w || this._latticeGfxH !== h) {
+      this._latticeGfx = this.p.createGraphics(w, h);
+      this._latticeGfx.pixelDensity(1);
+      this._latticeGfxW = w;
+      this._latticeGfxH = h;
+    }
 
-    const projectedEdges = this._projectedEdges;
-    projectedEdges.length = 0;
+    const g = this._latticeGfx;
+    g.clear();
 
-    for (const edge of latticeData.edges) {
-      if (edge.key && occluded.has(edge.key)) continue;
+    const bandCount = screenLattice.bandCount || Theme.grid.depthBands || 6;
+    this._ensureBandStyles(bandCount);
 
-      if (partialFootprints.length > 0) {
-        const visible = this._clipEdgeAgainstFootprints(
-          edge.x1, edge.y1, edge.x2, edge.y2, partialFootprints
-        );
-        for (const seg of visible) {
-          const a = camera.worldToScreen(seg.x1, seg.y1);
-          const b = camera.worldToScreen(seg.x2, seg.y2);
-          projectedEdges.push({ a, b, midY: (a.y + b.y) * 0.5 });
-        }
-      } else {
-        const a = camera.worldToScreen(edge.x1, edge.y1);
-        const b = camera.worldToScreen(edge.x2, edge.y2);
-        projectedEdges.push({ a, b, midY: (a.y + b.y) * 0.5 });
+    const buckets = this._bandBuckets;
+    for (let i = 0; i < bandCount; i++) buckets[i].length = 0;
+
+    for (const edge of screenLattice.edges) {
+      buckets[edge.band].push(edge);
+    }
+
+    const [r, gc, b] = this.gridLineRgb;
+    g.noFill();
+
+    for (let band = 0; band < bandCount; band++) {
+      const list = buckets[band];
+      if (list.length === 0) continue;
+      const style = this._bandStyles[band];
+      g.stroke(r, gc, b, style.alpha);
+      g.strokeWeight(style.weight);
+      for (let i = 0; i < list.length; i++) {
+        const e = list[i];
+        g.line(e.x1, e.y1, e.x2, e.y2);
       }
     }
 
-    const fadeBandPx = viewportHeight * Theme.depth.fadeBandHeight;
-    const farEdges = this._farEdges;
-    const nearEdges = this._nearEdges;
-    farEdges.length = 0;
-    nearEdges.length = 0;
-    for (const e of projectedEdges) {
-      (e.midY < fadeBandPx ? farEdges : nearEdges).push(e);
+    if (Theme.performance?.drawLatticeNodes && screenLattice.nodes.length > 0) {
+      const [nr, ng, nb] = this.nodeRgb;
+      const baseSize = Theme.grid.nodeSize;
+      g.noStroke();
+      g.rectMode(g.CENTER);
+      for (const node of screenLattice.nodes) {
+        const style = this._bandStyles[node.band];
+        g.fill(nr, ng, nb, style.alpha);
+        g.rect(node.x, node.y, baseSize * style.scale, baseSize * style.scale);
+      }
     }
 
-    const farNodes = this._farNodes;
-    const nearNodes = this._nearNodes;
-    farNodes.length = 0;
-    nearNodes.length = 0;
-    for (const node of latticeData.nodes) {
-      const s = camera.worldToScreen(node.x, node.y);
-      (s.y < fadeBandPx ? farNodes : nearNodes).push(s);
-    }
-
-    this._drawEdges(farEdges, viewportHeight);
-    this._drawEdges(nearEdges, viewportHeight);
-    this._drawNodes(farNodes, viewportHeight);
-    this._drawNodes(nearNodes, viewportHeight);
+    this._latticeGfxKey = cacheKey;
   }
 
-  _drawEdges(edges, viewportHeight) {
-    const p = this.p;
-    const [r, g, b] = this.gridLineRgb;
+  /** Precomputes per-band stroke alpha/weight so the lattice draw batches. */
+  _ensureBandStyles(bandCount) {
+    if (this._bandStyles && this._bandStyles.length === bandCount) return;
+
+    this._bandBuckets = Array.from({ length: bandCount }, () => []);
+    this._bandStyles = [];
     const baseWeight = Theme.grid.lineWidth;
 
-    p.noFill();
-    for (const edge of edges) {
-      const depth = depthFactorForScreenY(edge.midY, viewportHeight);
-      const alpha = opacityForDepthFactor(depth) * 255;
-      const weight = baseWeight * scaleForDepthFactor(depth);
-
-      p.stroke(r, g, b, alpha);
-      p.strokeWeight(weight);
-      p.line(edge.a.x, edge.a.y, edge.b.x, edge.b.y);
-    }
-  }
-
-  _drawNodes(nodes, viewportHeight) {
-    const p = this.p;
-    const [r, g, b] = this.nodeRgb;
-    const baseSize = Theme.grid.nodeSize;
-
-    p.noStroke();
-    for (const node of nodes) {
-      const depth = depthFactorForScreenY(node.y, viewportHeight);
-      const alpha = opacityForDepthFactor(depth) * 255;
-      const size = baseSize * scaleForDepthFactor(depth);
-
-      p.fill(r, g, b, alpha);
-      p.rectMode(p.CENTER);
-      p.rect(node.x, node.y, size, size);
+    for (let i = 0; i < bandCount; i++) {
+      const depth = (i + 0.5) / bandCount;
+      this._bandStyles.push({
+        alpha: opacityForDepthFactor(depth) * 255,
+        weight: baseWeight * scaleForDepthFactor(depth),
+        scale: scaleForDepthFactor(depth),
+      });
     }
   }
 
@@ -351,9 +351,12 @@ export class Renderer {
   drawSimulation(camera, simDrawData) {
     const vh = camera.viewportHeight;
     const occluded = simDrawData.occludedEdgeKeys || EMPTY_SET;
-    const partialFootprints = this._buildExtrusionFootprints(
-      simDrawData.partialSurfaces || EMPTY_ARR
-    );
+    // Partial footprints are rare (only cells mid scale-in). Skip clip work
+    // entirely when none exist — the common case once the world fills.
+    const partials = simDrawData.partialSurfaces || EMPTY_ARR;
+    const partialFootprints = partials.length > 0
+      ? this._buildExtrusionFootprints(partials)
+      : EMPTY_ARR;
     this._drawActivatedEdges(
       simDrawData.activatedEdges, camera, vh, occluded, partialFootprints
     );
@@ -416,30 +419,33 @@ export class Renderer {
     const [r, g, b] = this.activatedEdgeRgb;
     const baseWeight = Theme.activatedEdge.lineWidth;
 
+    // Batch: one stroke setup, then all lines. Depth variation is subtle on
+    // activated paths — use a single mid-band style to cut p5 state churn.
+    const midDepth = 0.65;
+    const alpha = opacityForDepthFactor(midDepth) * 255;
+    const weight = baseWeight * scaleForDepthFactor(midDepth);
+
     p.noFill();
+    p.stroke(r, g, b, alpha);
+    p.strokeWeight(weight);
+
+    const hasPartials = partialFootprints.length > 0;
+
     for (const edge of edges) {
       if (edge.key && occluded.has(edge.key)) continue;
 
-      let segments;
-      if (partialFootprints.length > 0) {
-        segments = this._clipEdgeAgainstFootprints(
+      if (hasPartials) {
+        const segments = this._clipEdgeAgainstFootprints(
           edge.x1, edge.y1, edge.x2, edge.y2, partialFootprints
         );
+        for (const seg of segments) {
+          const a  = camera.worldToScreen(seg.x1, seg.y1);
+          const b_ = camera.worldToScreen(seg.x2, seg.y2);
+          p.line(a.x, a.y, b_.x, b_.y);
+        }
       } else {
-        segments = [edge];
-      }
-
-      for (const seg of segments) {
-        const a  = camera.worldToScreen(seg.x1, seg.y1);
-        const b_ = camera.worldToScreen(seg.x2, seg.y2);
-        const midY = (a.y + b_.y) * 0.5;
-
-        const depth  = depthFactorForScreenY(midY, viewportHeight);
-        const alpha  = opacityForDepthFactor(depth) * 255;
-        const weight = baseWeight * scaleForDepthFactor(depth);
-
-        p.stroke(r, g, b, alpha);
-        p.strokeWeight(weight);
+        const a  = camera.worldToScreen(edge.x1, edge.y1);
+        const b_ = camera.worldToScreen(edge.x2, edge.y2);
         p.line(a.x, a.y, b_.x, b_.y);
       }
     }
@@ -456,9 +462,11 @@ export class Renderer {
     const bodyStart = this.signalBodyStartRgb;
     const bodyEnd   = this.signalBodyEndRgb;
     const tailRgb   = this.signalTailRgb;
-    const SUBDIVS   = 3;
+    const SUBDIVS   = Theme.performance?.signalSubdivs ?? 2;
     const OPAQUE = 255;
 
+    // AABB-only occluders — point-in-polygon against every platform per
+    // subdiv was O(signals × subdivs × platforms) and caused the fill stutter.
     const occluders = this._buildPlatformOccluders(surfaces, camera);
 
     p.noFill();
@@ -499,7 +507,11 @@ export class Renderer {
     }
   }
 
-  /** Screen-space platform volumes used to occlude lattice-level signals. */
+  /**
+   * Screen-space AABB volumes for signal occlusion.
+   * Footprint polygon tests were too expensive once many platforms exist;
+   * diamond AABBs are slightly conservative but visually fine for trails.
+   */
   _buildPlatformOccluders(surfaces, camera) {
     const occluders = this._occluders;
     occluders.length = 0;
@@ -507,37 +519,38 @@ export class Renderer {
     for (const surface of surfaces) {
       if (surface.animScale < 0.85) continue;
 
-      const baseCorners = surface.corners.map(c => camera.worldToScreen(c.x, c.y));
-      const baseCenter  = camera.worldToScreen(surface.center.x, surface.center.y);
-
-      const footprint = baseCorners.map(corner => ({
-        x: baseCenter.x + (corner.x - baseCenter.x) * surface.animScale,
-        y: baseCenter.y + (corner.y - baseCenter.y) * surface.animScale,
-      }));
-
-      const extrudePx = surface.heightPx * surface.extrusionScale;
-      let topY = Infinity;
-      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
-      for (const v of footprint) {
-        if (v.y < topY) topY = v.y;
-        if (v.x < minX) minX = v.x;
-        if (v.x > maxX) maxX = v.x;
-        if (v.y < minY) minY = v.y;
-        if (v.y > maxY) maxY = v.y;
+      const s = surface.animScale;
+      const cx = surface.center.x;
+      const cy = surface.center.y;
+      let minWX = Infinity, maxWX = -Infinity, minWY = Infinity, maxWY = -Infinity;
+      for (const c of surface.corners) {
+        const x = cx + (c.x - cx) * s;
+        const y = cy + (c.y - cy) * s;
+        if (x < minWX) minWX = x;
+        if (x > maxWX) maxWX = x;
+        if (y < minWY) minWY = y;
+        if (y > maxWY) maxWY = y;
       }
-      topY -= extrudePx;
 
-      occluders.push({ footprint, topY, minX, maxX, minY: topY, maxY });
+      const tl = camera.worldToScreen(minWX, minWY);
+      const br = camera.worldToScreen(maxWX, maxWY);
+      const extrudePx = surface.heightPx * surface.extrusionScale;
+      const minX = Math.min(tl.x, br.x);
+      const maxX = Math.max(tl.x, br.x);
+      const maxY = Math.max(tl.y, br.y);
+      const topY = Math.min(tl.y, br.y) - extrudePx;
+
+      occluders.push({ minX, maxX, minY: topY, maxY, topY });
     }
 
     return occluders;
   }
 
-  /** True when a screen point lies inside a solid platform's footprint below its top. */
+  /** True when a screen point lies inside a solid platform AABB below its top. */
   _isOccludedByPlatform(x, y, occluders) {
-    for (const occ of occluders) {
+    for (let i = 0; i < occluders.length; i++) {
+      const occ = occluders[i];
       if (x < occ.minX || x > occ.maxX || y < occ.minY || y > occ.maxY) continue;
-      if (!pointInPolygonFast(x, y, occ.footprint)) continue;
       if (y >= occ.topY - 1) return true;
     }
     return false;
@@ -592,79 +605,62 @@ export class Renderer {
       return a.center.x - b.center.x;
     });
 
+    // Scratch verts reused across surfaces — avoid 3× map() allocations each.
+    const fp = [
+      { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 },
+    ];
+    const top = [
+      { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 }, { x: 0, y: 0 },
+    ];
+
     for (const surface of sorted) {
       if (surface.animScale <= 0 && surface.extrusionScale <= 0) continue;
 
-      const baseCorners = surface.corners.map(c => camera.worldToScreen(c.x, c.y));
-      const baseCenter  = camera.worldToScreen(surface.center.x, surface.center.y);
+      const baseCenter = camera.worldToScreen(surface.center.x, surface.center.y);
+      const s = surface.animScale;
 
-      const footprint = baseCorners.map(corner => ({
-        x: baseCenter.x + (corner.x - baseCenter.x) * surface.animScale,
-        y: baseCenter.y + (corner.y - baseCenter.y) * surface.animScale,
-      }));
+      for (let i = 0; i < 4; i++) {
+        const c = surface.corners[i];
+        const sc = camera.worldToScreen(c.x, c.y);
+        fp[i].x = baseCenter.x + (sc.x - baseCenter.x) * s;
+        fp[i].y = baseCenter.y + (sc.y - baseCenter.y) * s;
+      }
 
       const extrudePx = surface.heightPx * surface.extrusionScale;
-
-      const elevatedTop = footprint.map(c => ({
-        x: c.x,
-        y: c.y - extrudePx,
-      }));
+      for (let i = 0; i < 4; i++) {
+        top[i].x = fp[i].x;
+        top[i].y = fp[i].y - extrudePx;
+      }
 
       // Solid footprint occludes lattice beneath the platform mass.
       if (surface.animScale > 0) {
         p.fill(sr, sg, sb, OPAQUE);
         p.beginShape();
-        for (const v of footprint) {
-          p.vertex(v.x, v.y);
-        }
+        for (let i = 0; i < 4; i++) p.vertex(fp[i].x, fp[i].y);
         p.endShape(p.CLOSE);
       }
 
-      // -----------------------------------------------------------------
-      // Side faces — ROOT CAUSE of the missing left face:
-      //
-      // Corner order from simulation: 0=top(back), 1=right, 2=bottom(front),
-      // 3=left. In this isometric view the viewer looks from the front
-      // (toward decreasing world-Y / corner 0). The two VISIBLE walls of an
-      // extruded prism are therefore the FRONT-facing edges:
-      //
-      //   Left  face → edge 3–2 (left → bottom)
-      //   Right face → edge 1–2 (right → bottom)
-      //
-      // The previous code extruded edge 0–3 (top → left). That is the
-      // BACK-left wall. After the elevated top is painted, that quad sits
-      // entirely behind the top face and disappears — looking like a
-      // "missing left face". The polygon was never degenerate and winding
-      // was fine; the wrong edge was chosen.
-      //
-      // Both visible walls share the front (bottom) vertex, which is the
-      // correct isometric prism silhouette.
-      // -----------------------------------------------------------------
+      // Visible walls: front-left (3–2) and front-right (1–2).
       if (surface.extrusionScale > 0) {
-        // LEFT face — front-left wall (corners 3 → 2)
         p.fill(lr, lg, lb, OPAQUE);
         p.beginShape();
-        p.vertex(footprint[3].x, footprint[3].y);
-        p.vertex(footprint[2].x, footprint[2].y);
-        p.vertex(elevatedTop[2].x, elevatedTop[2].y);
-        p.vertex(elevatedTop[3].x, elevatedTop[3].y);
+        p.vertex(fp[3].x, fp[3].y);
+        p.vertex(fp[2].x, fp[2].y);
+        p.vertex(top[2].x, top[2].y);
+        p.vertex(top[3].x, top[3].y);
         p.endShape(p.CLOSE);
 
-        // RIGHT face — front-right wall (corners 1 → 2)
         p.fill(rr, rg, rb, OPAQUE);
         p.beginShape();
-        p.vertex(footprint[1].x, footprint[1].y);
-        p.vertex(footprint[2].x, footprint[2].y);
-        p.vertex(elevatedTop[2].x, elevatedTop[2].y);
-        p.vertex(elevatedTop[1].x, elevatedTop[1].y);
+        p.vertex(fp[1].x, fp[1].y);
+        p.vertex(fp[2].x, fp[2].y);
+        p.vertex(top[2].x, top[2].y);
+        p.vertex(top[1].x, top[1].y);
         p.endShape(p.CLOSE);
 
-        // TOP face — drawn last so it caps the prism
         p.fill(sr, sg, sb, OPAQUE);
         p.beginShape();
-        for (const v of elevatedTop) {
-          p.vertex(v.x, v.y);
-        }
+        for (let i = 0; i < 4; i++) p.vertex(top[i].x, top[i].y);
         p.endShape(p.CLOSE);
       }
     }
