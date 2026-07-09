@@ -357,9 +357,15 @@ export class Renderer {
     const partialFootprints = partials.length > 0
       ? this._buildExtrusionFootprints(partials)
       : EMPTY_ARR;
-    this._drawActivatedEdges(
-      simDrawData.activatedEdges, camera, vh, occluded, partialFootprints
-    );
+
+    // Activated "scars" are optional. Default off so the lattice stays clean —
+    // only the live pulse + extrusions read as lasting marks.
+    if (Theme.activatedEdge.drawScars !== false) {
+      this._drawActivatedEdges(
+        simDrawData.activatedEdges, camera, vh, occluded, partialFootprints
+      );
+    }
+
     this._drawSurfaces(simDrawData.surfaces, simDrawData.interiorEdges, camera, vh);
     this._drawSignals(simDrawData.signals, simDrawData.surfaces, camera, vh);
   }
