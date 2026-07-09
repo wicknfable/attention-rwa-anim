@@ -62,6 +62,7 @@ export function createAttentionSketch(container) {
 
     p.setup = () => {
       // Prefer smooth 60 FPS over retina sharpness for production embeds.
+      // Absolute backgrounds run continuously — keep density low.
       p.pixelDensity(1);
 
       const { width, height } = measureHost(host);
