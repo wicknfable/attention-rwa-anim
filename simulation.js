@@ -240,6 +240,16 @@ export class Simulation {
      * Retried whenever a platform collapses and frees the view.
      */
     this._deferredCells = new Set();
+
+    // --- Draw-data caches (avoid per-frame allocation storms) --------------
+    /** @type {Map<string, {x1:number,y1:number,x2:number,y2:number,key:string}>} */
+    this._activatedEdgeGeom = new Map();
+    this._drawSurfaces = [];
+    this._drawInteriorEdges = [];
+    this._drawPartialSurfaces = [];
+    this._drawOccludedKeys = new Set();
+    this._drawSignals = [];
+    this._seenInterior = new Set();
   }
 
   // -------------------------------------------------------------------------
@@ -288,17 +298,10 @@ export class Simulation {
    * }}
    */
   getDrawData() {
-    const activatedEdges = this._buildActivatedEdgeGeometry();
-    const signals        = this._buildSignalGeometry();
-    const { surfaces, interiorEdges, occludedEdgeKeys, partialSurfaces } =
-      this._buildSurfaceGeometry();
     return {
-      activatedEdges,
-      signals,
-      surfaces,
-      interiorEdges,
-      occludedEdgeKeys,
-      partialSurfaces,
+      activatedEdges: this._buildActivatedEdgeGeometry(),
+      signals:        this._buildSignalGeometry(),
+      ...this._buildSurfaceGeometry(),
     };
   }
 
@@ -444,6 +447,11 @@ export class Simulation {
     if (this.activatedEdgeKeys.has(key)) return;
 
     this.activatedEdgeKeys.add(key);
+    const a = latticeNodeWorldPosition(fromNode.i, fromNode.j);
+    const b = latticeNodeWorldPosition(toNode.i, toNode.j);
+    this._activatedEdgeGeom.set(key, {
+      x1: a.x, y1: a.y, x2: b.x, y2: b.y, key,
+    });
 
     const cellsToCheck = this._cellsAdjacentToEdge(fromNode, toNode);
     for (const [ci, cj] of cellsToCheck) {
@@ -795,15 +803,29 @@ export class Simulation {
       // by any live cell (they only exist to seed future loops — safe to
       // clear periodically so the set stays bounded).
       if (outside || !this._edgeRequiredByCompletedCell(key)) {
-        // Keep a fraction of in-radius orphans so construction can still emerge.
-        if (!outside && Math.random() < 0.55) continue;
+        // Keep a small fraction of in-radius orphans so loops can still form.
+        if (!outside && Math.random() < 0.25) continue;
         this.activatedEdgeKeys.delete(key);
+        this._activatedEdgeGeom.delete(key);
       }
     }
 
     // Cap deferred set size.
     if (this._deferredCells.size > 64) {
       this._deferredCells.clear();
+    }
+
+    // Hard ceiling — if still over budget, drop oldest orphans first.
+    const maxEdges = Theme.world.maxActivatedEdges || 160;
+    if (this.activatedEdgeKeys.size > maxEdges) {
+      const excess = this.activatedEdgeKeys.size - maxEdges;
+      let dropped = 0;
+      for (const key of this.activatedEdgeKeys) {
+        if (keep.has(key)) continue;
+        this.activatedEdgeKeys.delete(key);
+        this._activatedEdgeGeom.delete(key);
+        if (++dropped >= excess) break;
+      }
     }
   }
 
@@ -814,6 +836,7 @@ export class Simulation {
     for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
       if (!this._edgeRequiredByCompletedCell(eKey)) {
         this.activatedEdgeKeys.delete(eKey);
+        this._activatedEdgeGeom.delete(eKey);
       }
     }
 
@@ -861,29 +884,38 @@ export class Simulation {
   // -------------------------------------------------------------------------
 
   _buildActivatedEdgeGeometry() {
-    const result = [];
-    for (const key of this.activatedEdgeKeys) {
-      const { i1, j1, i2, j2 } = parseEdgeKey(key);
-      const a = latticeNodeWorldPosition(i1, j1);
-      const b = latticeNodeWorldPosition(i2, j2);
-      result.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, key });
+    // Geometry is stored at activation time — no parse/project every frame.
+    // Reuse one array so we don't allocate thousands of entries of GC pressure.
+    if (!this._activatedEdgeList) this._activatedEdgeList = [];
+    const result = this._activatedEdgeList;
+    result.length = 0;
+    for (const geom of this._activatedEdgeGeom.values()) {
+      result.push(geom);
     }
     return result;
   }
 
   _buildSignalGeometry() {
-    return this.signals.map(signal => ({
-      segments: buildSignalTrailSegments(signal),
-    }));
+    const out = this._drawSignals;
+    out.length = 0;
+    for (let i = 0; i < this.signals.length; i++) {
+      out.push({ segments: buildSignalTrailSegments(this.signals[i]) });
+    }
+    return out;
   }
 
   _buildSurfaceGeometry() {
-    const surfaces      = [];
-    const interiorEdges = [];
-    const seenInterior = new Set();
-    /** @type {Set<string>} */
-    const occludedEdgeKeys = new Set();
-    const partialSurfaces = [];
+    const surfaces = this._drawSurfaces;
+    const interiorEdges = this._drawInteriorEdges;
+    const partialSurfaces = this._drawPartialSurfaces;
+    const occludedEdgeKeys = this._drawOccludedKeys;
+    const seenInterior = this._seenInterior;
+
+    surfaces.length = 0;
+    interiorEdges.length = 0;
+    partialSurfaces.length = 0;
+    occludedEdgeKeys.clear();
+    seenInterior.clear();
 
     for (const cell of this.completedCells.values()) {
       const animScale      = easeOutCubic(cell.surfaceProgress);
@@ -938,10 +970,15 @@ export class Simulation {
 
         if (!seenInterior.has(eKey)) {
           seenInterior.add(eKey);
-          const { i1, j1, i2, j2 } = parseEdgeKey(eKey);
-          const a = latticeNodeWorldPosition(i1, j1);
-          const b = latticeNodeWorldPosition(i2, j2);
-          interiorEdges.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+          const geom = this._activatedEdgeGeom.get(eKey);
+          if (geom) {
+            interiorEdges.push(geom);
+          } else {
+            const { i1, j1, i2, j2 } = parseEdgeKey(eKey);
+            const a = latticeNodeWorldPosition(i1, j1);
+            const b = latticeNodeWorldPosition(i2, j2);
+            interiorEdges.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+          }
         }
       }
     }
