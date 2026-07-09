@@ -16,7 +16,7 @@
  */
 
 import { Theme } from './theme.js';
-import { latticeNodeWorldPosition } from './grid.js';
+import { latticeNodeWorldPosition, latticeEdgeKey } from './grid.js';
 import { trimSignalTrail, buildSignalTrailSegments } from './signals.js';
 
 // ---------------------------------------------------------------------------
@@ -39,9 +39,7 @@ const HEIGHT_LEVELS = Theme.heights;
  * guaranteeing the same key regardless of traversal direction.
  */
 function edgeKey(i1, j1, i2, j2) {
-  const a = `${i1},${j1}`;
-  const b = `${i2},${j2}`;
-  return a < b ? `${a}|${b}` : `${b}|${a}`;
+  return latticeEdgeKey(i1, j1, i2, j2);
 }
 
 /** Parses an edge key back into its two lattice node coordinates. */
@@ -260,17 +258,27 @@ export class Simulation {
    * The renderer should treat this as immutable read-only data.
    *
    * @returns {{
-   *   activatedEdges: Array<{x1,y1,x2,y2}>,
-   *   signals:        Array<{segments:Array<{x1,y1,x2,y2,uStart,uEnd}>}>,
-   *   surfaces:       Array<{corners,center,animScale,extrusionScale,heightPx,ci,cj}>,
-   *   interiorEdges:  Array<{x1,y1,x2,y2}>
+   *   activatedEdges: Array<{x1,y1,x2,y2,key}>,
+   *   signals:        Array<{segments:Array}>,
+   *   surfaces:       Array,
+   *   interiorEdges:  Array,
+   *   occludedEdgeKeys: Set<string>,
+   *   partialSurfaces: Array
    * }}
    */
   getDrawData() {
     const activatedEdges = this._buildActivatedEdgeGeometry();
     const signals        = this._buildSignalGeometry();
-    const { surfaces, interiorEdges } = this._buildSurfaceGeometry();
-    return { activatedEdges, signals, surfaces, interiorEdges };
+    const { surfaces, interiorEdges, occludedEdgeKeys, partialSurfaces } =
+      this._buildSurfaceGeometry();
+    return {
+      activatedEdges,
+      signals,
+      surfaces,
+      interiorEdges,
+      occludedEdgeKeys,
+      partialSurfaces,
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -755,7 +763,7 @@ export class Simulation {
       const { i1, j1, i2, j2 } = parseEdgeKey(key);
       const a = latticeNodeWorldPosition(i1, j1);
       const b = latticeNodeWorldPosition(i2, j2);
-      result.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y });
+      result.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y, key });
     }
     return result;
   }
@@ -770,6 +778,9 @@ export class Simulation {
     const surfaces      = [];
     const interiorEdges = [];
     const seenInterior = new Set();
+    /** @type {Set<string>} */
+    const occludedEdgeKeys = new Set();
+    const partialSurfaces = [];
 
     for (const cell of this.completedCells.values()) {
       const animScale      = easeOutCubic(cell.surfaceProgress);
@@ -784,6 +795,22 @@ export class Simulation {
         ci:             cell.ci,
         cj:             cell.cj,
       });
+
+      if (animScale <= 0) continue;
+
+      // Fully expanded cells: O(1) cull of their four boundary edges.
+      // Scaling cells: expensive polygon clip only for these few footprints.
+      if (animScale >= 0.98) {
+        for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
+          occludedEdgeKeys.add(eKey);
+        }
+      } else {
+        partialSurfaces.push({
+          corners: cell.corners,
+          center:  cell.center,
+          animScale,
+        });
+      }
 
       if (animScale < 0.98) continue;
 
@@ -816,6 +843,6 @@ export class Simulation {
       }
     }
 
-    return { surfaces, interiorEdges };
+    return { surfaces, interiorEdges, occludedEdgeKeys, partialSurfaces };
   }
 }
