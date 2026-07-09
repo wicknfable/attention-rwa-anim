@@ -18,6 +18,10 @@
  *   IntersectionObserver — stop when the container leaves the viewport
  *   Page Visibility API — stop when the browser tab is hidden
  *   Simulation state is preserved; resume continues seamlessly
+ *
+ * Performance (fixed absolute background):
+ *   Camera never pans — lattice is projected to screen once per resize
+ *   and redrawn from that cache. Target FPS is intentionally modest.
  * ------------------------------------------------------------------------
  */
 
@@ -55,13 +59,35 @@ export function createAttentionSketch(container) {
     /** @type {IntersectionObserver|null} */
     let intersectionObserver = null;
 
+    /**
+     * Screen-space lattice cache. Rebuilt only on resize — the camera is
+     * static for absolute-positioned backgrounds, so projecting thousands
+     * of edges every frame was pure waste.
+     * @type {{ edges: Array, nodes: Array } | null}
+     */
+    let screenLattice = null;
+
     const onVisibilityChange = () => {
       pageVisible = !document.hidden;
       syncLoop();
     };
 
+    function rebuildScreenLattice() {
+      const visibleBounds = camera.getVisibleWorldBounds(Theme.grid.overscanFactor);
+      const latticeData = generateLatticeData(visibleBounds);
+      screenLattice = projectLatticeToScreen(latticeData, camera);
+    }
+
+    function applyHostSize(width, height) {
+      p.resizeCanvas(width, height);
+      camera.x = width * 0.10;
+      camera.y = height * -0.05;
+      camera.resize(width, height);
+      rebuildScreenLattice();
+    }
+
     p.setup = () => {
-      // Prefer smooth 60 FPS over retina sharpness for production embeds.
+      // Prefer smooth playback over retina sharpness for production embeds.
       // Absolute backgrounds run continuously — keep density low.
       p.pixelDensity(1);
 
@@ -83,17 +109,17 @@ export function createAttentionSketch(container) {
       simulation = new Simulation();
 
       camera.resize(width, height);
-      p.frameRate(60);
+      rebuildScreenLattice();
+
+      const targetFps = Theme.performance?.targetFps ?? 30;
+      p.frameRate(targetFps);
 
       // Container-driven resize (Webflow embeds are rarely window-sized).
       if (typeof ResizeObserver !== 'undefined') {
         resizeObserver = new ResizeObserver(() => {
           const size = measureHost(host);
           if (size.width === p.width && size.height === p.height) return;
-          p.resizeCanvas(size.width, size.height);
-          camera.x = size.width * 0.10;
-          camera.y = size.height * -0.05;
-          camera.resize(size.width, size.height);
+          applyHostSize(size.width, size.height);
         });
         resizeObserver.observe(host);
       }
@@ -115,19 +141,17 @@ export function createAttentionSketch(container) {
 
     p.draw = () => {
       if (!running) return;
+      if (!screenLattice) rebuildScreenLattice();
 
       // 1. Advance simulation — pure state update, no drawing.
       simulation.update(p.deltaTime);
 
-      // 2. Snapshot draw data so the lattice pass can clip hidden edges.
+      // 2. Snapshot draw data so the lattice pass can cull hidden edges.
       const simDrawData = simulation.getDrawData();
 
-      // 3. Inactive lattice (background, visible edges, nodes).
-      const visibleBounds = camera.getVisibleWorldBounds(Theme.grid.overscanFactor);
-      const latticeData   = generateLatticeData(visibleBounds);
-      renderer.render(camera, latticeData, {
+      // 3. Inactive lattice from screen-space cache (no world→screen work).
+      renderer.renderScreenLattice(screenLattice, {
         occludedEdgeKeys: simDrawData.occludedEdgeKeys,
-        partialSurfaces:   simDrawData.partialSurfaces,
       });
 
       // 4. Simulation layer: activated edges → extrusions → signals.
@@ -137,10 +161,7 @@ export function createAttentionSketch(container) {
     // Fallback when ResizeObserver is unavailable.
     p.windowResized = () => {
       const size = measureHost(host);
-      p.resizeCanvas(size.width, size.height);
-      camera.x = size.width * 0.10;
-      camera.y = size.height * -0.05;
-      camera.resize(size.width, size.height);
+      applyHostSize(size.width, size.height);
     };
 
     function syncLoop() {
@@ -163,6 +184,45 @@ export function createAttentionSketch(container) {
   };
 
   return new p5(sketch, host);
+}
+
+/**
+ * Projects world lattice into screen pixels once. Depth band is precomputed
+ * so the renderer can batch strokes without per-edge math every frame.
+ */
+function projectLatticeToScreen(latticeData, camera) {
+  const vh = camera.viewportHeight;
+  const fadeBandPx = Math.max(1, vh * Theme.depth.fadeBandHeight);
+  const bandCount = Theme.grid.depthBands || 6;
+
+  const edges = [];
+  for (const edge of latticeData.edges) {
+    const a = camera.worldToScreen(edge.x1, edge.y1);
+    const b = camera.worldToScreen(edge.x2, edge.y2);
+    const midY = (a.y + b.y) * 0.5;
+    const t = Math.min(1, Math.max(0, midY / fadeBandPx));
+    const depth = t * t * (3 - 2 * t); // same smoothstep as renderer
+    const band = Math.min(bandCount - 1, Math.floor(depth * bandCount));
+    edges.push({
+      key: edge.key,
+      x1: a.x, y1: a.y, x2: b.x, y2: b.y,
+      band,
+      depth,
+    });
+  }
+
+  const nodes = [];
+  if (Theme.performance?.drawLatticeNodes) {
+    for (const node of latticeData.nodes) {
+      const s = camera.worldToScreen(node.x, node.y);
+      const t = Math.min(1, Math.max(0, s.y / fadeBandPx));
+      const depth = t * t * (3 - 2 * t);
+      const band = Math.min(bandCount - 1, Math.floor(depth * bandCount));
+      nodes.push({ x: s.x, y: s.y, band, depth });
+    }
+  }
+
+  return { edges, nodes, bandCount };
 }
 
 /** Resolves a mount target without hardcoding document.body as the only option. */
