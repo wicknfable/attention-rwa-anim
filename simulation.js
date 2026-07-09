@@ -173,7 +173,6 @@ class UnionFind {
     const rootB = this.find(b);
     if (rootA === rootB) return null;
 
-    // Union by rank keeps the tree shallow.
     if (this._rank.get(rootA) < this._rank.get(rootB)) {
       this._parent.set(rootA, rootB);
       return rootB;
@@ -185,6 +184,12 @@ class UnionFind {
       this._rank.set(rootA, this._rank.get(rootA) + 1);
       return rootA;
     }
+  }
+
+  /** Removes a leaf element that is no longer in the world. */
+  remove(id) {
+    this._parent.delete(id);
+    this._rank.delete(id);
   }
 }
 
@@ -226,6 +231,8 @@ export class Simulation {
     this._spawnCooldownMs = 0;
     this._firstSpawnDone  = false;
     this._simTimeMs       = 0;
+    this._edgePruneTimerMs = 0;
+    this._occupancyTimerMs = 0;
 
     /**
      * Cells whose four edges are closed but which were deferred because a
@@ -244,13 +251,27 @@ export class Simulation {
    * Called once per frame from sketch.js.
    */
   update(deltaMs) {
-    this._simTimeMs += deltaMs;
-    this._trySpawnSignal(deltaMs);
-    this._updateSignals(deltaMs);
-    this._updateSurfaceAnimations(deltaMs);
+    // Clamp huge frame gaps (tab resume) so simulation doesn't explode.
+    const dt = Math.min(deltaMs, 50);
+
+    this._simTimeMs += dt;
+    this._trySpawnSignal(dt);
+    this._updateSignals(dt);
+    this._updateSurfaceAnimations(dt);
     this._checkPlatformLifetimes();
-    this._manageWorldOccupancy();
-    this._retryDeferredCompletions();
+
+    this._occupancyTimerMs += dt;
+    if (this._occupancyTimerMs >= 400) {
+      this._occupancyTimerMs = 0;
+      this._manageWorldOccupancy();
+      this._retryDeferredCompletions();
+    }
+
+    this._edgePruneTimerMs += dt;
+    if (this._edgePruneTimerMs >= Theme.world.edgePruneIntervalMs) {
+      this._edgePruneTimerMs = 0;
+      this._pruneActivatedEdges();
+    }
   }
 
   /**
@@ -286,8 +307,11 @@ export class Simulation {
   // -------------------------------------------------------------------------
 
   _trySpawnSignal(deltaMs) {
+    const maxConcurrent = Theme.spawn.maxConcurrent;
+
     if (!this._firstSpawnDone) {
-      for (let i = 0; i < 3; i++) this._spawnSignal();
+      const initial = Math.min(2, maxConcurrent);
+      for (let i = 0; i < initial; i++) this._spawnSignal();
       this._firstSpawnDone = true;
       this._resetSpawnCooldown();
       return;
@@ -295,9 +319,12 @@ export class Simulation {
 
     this._spawnCooldownMs -= deltaMs;
 
-    const minConcurrent = 4;
-    if (this.signals.length < minConcurrent || this._spawnCooldownMs <= 0) {
+    // Only spawn when under the hard cap AND the cooldown has elapsed.
+    // (Previously cooldown alone could spawn forever → unbounded signals.)
+    if (this._spawnCooldownMs <= 0 && this.signals.length < maxConcurrent) {
       this._spawnSignal();
+      this._resetSpawnCooldown();
+    } else if (this._spawnCooldownMs <= 0) {
       this._resetSpawnCooldown();
     }
   }
@@ -308,23 +335,29 @@ export class Simulation {
   }
 
   /**
-   * Spawns an independent explorer signal at a random lattice node.
-   * Signals wander freely — construction is never an explicit goal.
+   * Spawns an independent explorer signal inside the working lattice radius.
    */
   _spawnSignal() {
-    const range = 8;
+    if (this.signals.length >= Theme.spawn.maxConcurrent) return;
+
+    const range = Theme.world.activeCellRadius;
     const si = Math.floor((Math.random() - 0.5) * range * 2);
     const sj = Math.floor((Math.random() - 0.5) * range * 2);
 
     const offsets = [...NEIGHBOUR_OFFSETS].sort(() => Math.random() - 0.5);
     const firstNeighbour = offsets[0];
 
+    const maxEdges = Theme.signal.minEdges +
+      Math.floor(Math.random() * (Theme.signal.maxEdges - Theme.signal.minEdges + 1));
+
     this.signals.push({
-      fromNode:    { i: si, j: sj },
-      toNode:      { i: si + firstNeighbour.di, j: sj + firstNeighbour.dj },
-      progress:    0,
-      prevNodeKey: cellKey(si, sj),
-      trailNodes:  [{ i: si, j: sj }],
+      fromNode:       { i: si, j: sj },
+      toNode:         { i: si + firstNeighbour.di, j: sj + firstNeighbour.dj },
+      progress:       0,
+      edgesTraversed: 0,
+      maxEdges,
+      prevNodeKey:    cellKey(si, sj),
+      trailNodes:     [{ i: si, j: sj }],
     });
   }
 
@@ -334,6 +367,7 @@ export class Simulation {
 
   _updateSignals(deltaMs) {
     const nextSignals = [];
+    const R = Theme.world.activeCellRadius;
 
     for (const signal of this.signals) {
       const progressDelta = PROGRESS_PER_MS * deltaMs;
@@ -341,9 +375,19 @@ export class Simulation {
 
       if (signal.progress >= 1) {
         this._activateEdge(signal.fromNode, signal.toNode);
+        signal.edgesTraversed++;
+
+        if (signal.edgesTraversed >= signal.maxEdges) {
+          continue; // retire — finite lifetime prevents unbounded growth
+        }
 
         const nextEdge = this._chooseNextEdge(signal.toNode, signal.fromNode);
         if (!nextEdge) continue;
+
+        // Soft wall: retire if the signal drifts outside the working radius.
+        if (Math.abs(nextEdge.i) > R || Math.abs(nextEdge.j) > R) {
+          continue;
+        }
 
         signal.trailNodes.push({ ...signal.toNode });
         trimSignalTrail(signal);
@@ -389,20 +433,18 @@ export class Simulation {
   // -------------------------------------------------------------------------
 
   _activateEdge(fromNode, toNode) {
+    const R = Theme.world.activeCellRadius;
+    // Never record edges outside the working radius — infinite lattice leak.
+    if (Math.abs(fromNode.i) > R || Math.abs(fromNode.j) > R ||
+        Math.abs(toNode.i) > R || Math.abs(toNode.j) > R) {
+      return;
+    }
+
     const key = edgeKey(fromNode.i, fromNode.j, toNode.i, toNode.j);
     if (this.activatedEdgeKeys.has(key)) return;
 
     this.activatedEdgeKeys.add(key);
 
-    // Check whether activating this edge completes any diamond cells.
-    // The cells that could be completed by this edge depend on which
-    // direction the edge runs:
-    //
-    //   u-direction edge (i,j)→(i+1,j):  could complete cells (i,j) and (i,j-1)
-    //   v-direction edge (i,j)→(i,j+1):  could complete cells (i,j) and (i-1,j)
-    //
-    // Rather than special-casing direction, we check all cells that share
-    // any of the four edges at either endpoint — simpler and still O(1).
     const cellsToCheck = this._cellsAdjacentToEdge(fromNode, toNode);
     for (const [ci, cj] of cellsToCheck) {
       this._checkAndCompleteCell(ci, cj);
@@ -436,8 +478,17 @@ export class Simulation {
 
   /** Checks if all four edges of cell (ci,cj) are activated; if so, completes it. */
   _checkAndCompleteCell(ci, cj) {
+    const R = Theme.world.activeCellRadius;
+    if (Math.abs(ci) > R || Math.abs(cj) > R) return;
+
     const key = cellKey(ci, cj);
     if (this.completedCells.has(key)) return;
+
+    // Hard ceiling — refuse new construction when at budget.
+    if (this.completedCells.size >= Theme.world.maxCompletedCells) {
+      this._deferredCells.add(key);
+      return;
+    }
 
     const edges = cellEdgeKeys(ci, cj);
     const allActive = edges.every(e => this.activatedEdgeKeys.has(e));
@@ -446,19 +497,6 @@ export class Simulation {
       return;
     }
 
-    // -----------------------------------------------------------------
-    // Foreground occupancy — ROOT CAUSE of incorrect visual overlap:
-    //
-    // Depth-sorting alone cannot fix fake isometric extrusions. A platform
-    // built BEHIND an existing foreground mass still paints side faces that
-    // intersect the nearer prism in screen space, because vertical lift is
-    // a 2D offset, not true 3D occlusion.
-    //
-    // Treat completed extrusions as solid architectural mass. If any
-    // non-collapsing platform already sits in the isometric foreground of
-    // this cell (toward the viewer / higher world depth), defer construction
-    // and let signals keep exploring elsewhere. Retry when that mass clears.
-    // -----------------------------------------------------------------
     if (this._hasForegroundMass(ci, cj)) {
       this._deferredCells.add(key);
       return;
@@ -466,15 +504,12 @@ export class Simulation {
 
     this._deferredCells.delete(key);
 
-    // Cell is complete — create the surface record.
     const corners = cellWorldCorners(ci, cj);
     const center  = cellWorldCenter(corners);
 
-    // Register with union-find and assign/inherit cluster height.
     this._uf.add(key);
     let heightPx = this._pickHeightForCell(ci, cj);
 
-    // Check adjacent completed cells; merge clusters if found.
     const adjacentOffsets = [[1,0],[-1,0],[0,1],[0,-1]];
     for (const [dci, dcj] of adjacentOffsets) {
       const adjKey = cellKey(ci + dci, cj + dcj);
@@ -489,7 +524,6 @@ export class Simulation {
       }
     }
 
-    // Ensure the root's height is set (handles the no-adjacent-cells case).
     const myRoot = this._uf.find(key);
     if (!this._clusterHeights.has(myRoot)) {
       this._clusterHeights.set(myRoot, heightPx);
@@ -658,11 +692,14 @@ export class Simulation {
   // -------------------------------------------------------------------------
 
   _checkPlatformLifetimes() {
+    // Collapse up to 2 expired platforms per frame so backlog clears quickly.
+    let collapsed = 0;
     for (const cell of this.completedCells.values()) {
       if (cell.phase !== 'done') continue;
       if (cell.expiresAt == null || this._simTimeMs < cell.expiresAt) continue;
       this._beginCollapse(cell);
-      return;
+      collapsed++;
+      if (collapsed >= 2) return;
     }
   }
 
@@ -690,8 +727,9 @@ export class Simulation {
   }
 
   _manageWorldOccupancy() {
+    const overCap = this.completedCells.size > Theme.world.maxCompletedCells;
     const occupancy = this._computeOccupancy();
-    if (occupancy <= Theme.world.maxOccupancy) return;
+    if (!overCap && occupancy <= Theme.world.maxOccupancy) return;
 
     const candidates = [];
     for (const cell of this.completedCells.values()) {
@@ -699,9 +737,74 @@ export class Simulation {
     }
     if (candidates.length === 0) return;
 
-    candidates.sort((a, b) => a.completedAt - b.completedAt);
-    const pickFrom = candidates.slice(0, Math.max(1, Math.ceil(candidates.length * 0.35)));
-    this._beginCollapse(pickFrom[Math.floor(Math.random() * pickFrom.length)]);
+    // Prefer oldest — no full sort; pick from a small sample of earliest.
+    let oldest = candidates[0];
+    for (let i = 1; i < candidates.length; i++) {
+      if (candidates[i].completedAt < oldest.completedAt) oldest = candidates[i];
+    }
+    this._beginCollapse(oldest);
+
+    // If still over hard cap, collapse one more immediately.
+    if (this.completedCells.size > Theme.world.maxCompletedCells) {
+      let second = null;
+      for (const cell of this.completedCells.values()) {
+        if (cell.phase !== 'done' || cell === oldest) continue;
+        if (!second || cell.completedAt < second.completedAt) second = cell;
+      }
+      if (second) this._beginCollapse(second);
+    }
+  }
+
+  /**
+   * Drops activated edges that are no longer needed and sit outside the
+   * working radius — or orphan edges not bordering any completed cell.
+   * Without this, activatedEdgeKeys grows without bound and freezes the tab.
+   */
+  _pruneActivatedEdges() {
+    const R = Theme.world.activeCellRadius;
+    const keep = new Set();
+
+    // Edges that form completed (or collapsing) cell boundaries must stay.
+    for (const cell of this.completedCells.values()) {
+      for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
+        keep.add(eKey);
+      }
+    }
+
+    // Edges currently under an active signal trail stay.
+    for (const signal of this.signals) {
+      const nodes = signal.trailNodes;
+      for (let i = 1; i < nodes.length; i++) {
+        keep.add(edgeKey(nodes[i - 1].i, nodes[i - 1].j, nodes[i].i, nodes[i].j));
+      }
+      keep.add(edgeKey(
+        signal.fromNode.i, signal.fromNode.j,
+        signal.toNode.i, signal.toNode.j
+      ));
+    }
+
+    for (const key of this.activatedEdgeKeys) {
+      if (keep.has(key)) continue;
+
+      const { i1, j1, i2, j2 } = parseEdgeKey(key);
+      const outside =
+        Math.abs(i1) > R || Math.abs(j1) > R ||
+        Math.abs(i2) > R || Math.abs(j2) > R;
+
+      // Drop outside edges always; drop orphan interior edges not needed
+      // by any live cell (they only exist to seed future loops — safe to
+      // clear periodically so the set stays bounded).
+      if (outside || !this._edgeRequiredByCompletedCell(key)) {
+        // Keep a fraction of in-radius orphans so construction can still emerge.
+        if (!outside && Math.random() < 0.55) continue;
+        this.activatedEdgeKeys.delete(key);
+      }
+    }
+
+    // Cap deferred set size.
+    if (this._deferredCells.size > 64) {
+      this._deferredCells.clear();
+    }
   }
 
   _finalizeCollapse(cell) {
@@ -726,7 +829,7 @@ export class Simulation {
       this._clusterHeights.delete(root);
     }
 
-    this._retryDeferredCompletions();
+    this._uf.remove(key);
   }
 
   /** True when any remaining completed cell shares this edge on its boundary. */
