@@ -28,6 +28,7 @@ const EDGE_LENGTH   = Theme.grid.spacing; // basis vectors have magnitude = spac
 const PROGRESS_PER_MS = SIGNAL_SPEED / (EDGE_LENGTH * 1000); // progress units per ms
 
 const HEIGHT_LEVELS = Theme.heights;
+const EMPTY_ACTIVATED = [];
 
 // ---------------------------------------------------------------------------
 // Pure lattice topology helpers
@@ -309,8 +310,10 @@ export class Simulation {
    * }}
    */
   getDrawData() {
+    const drawScars = Theme.activatedEdge.drawScars !== false;
     return {
-      activatedEdges: this._buildActivatedEdgeGeometry(),
+      // Empty when scars are hidden — skip drawing + projection cost.
+      activatedEdges: drawScars ? this._buildActivatedEdgeGeometry() : EMPTY_ACTIVATED,
       signals:        this._buildSignalGeometry(),
       ...this._buildSurfaceGeometry(),
     };
@@ -896,13 +899,12 @@ export class Simulation {
     const key = cellKey(cell.ci, cell.cj);
     this.completedCells.delete(key);
 
-    const ttl = Theme.activatedEdge.trailTtlMs || 2800;
+    // Platform gone — drop its boundary trails immediately so the lattice
+    // returns to its clean original state (no lingering scars).
     for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
-      if (this._edgeRequiredByCompletedCell(eKey)) continue;
-      const edge = this.activatedEdges.get(eKey);
-      if (!edge) continue;
-      // Platform gone — let the trail die soon instead of lingering forever.
-      edge.expiresAt = Math.min(edge.expiresAt, this._simTimeMs + Math.min(800, ttl * 0.35));
+      if (!this._edgeRequiredByCompletedCell(eKey)) {
+        this.activatedEdges.delete(eKey);
+      }
     }
 
     const root = this._uf.find(key);
