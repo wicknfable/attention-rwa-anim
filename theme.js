@@ -65,15 +65,18 @@ export const Theme = {
   // ---- Activated edge appearance (after a signal passes through) --------
   activatedEdge: {
     // Slightly darker than the inactive grid line (#E3E5E8) so activated
-    // paths are legible without being loud.
+    // paths are legible without being loud — only used if drawScars is true.
     color: '#C5CAD0',
     lineWidth: 1.5,
-    // Trails are NOT permanent. After this TTL they fade unless they currently
-    // form a completed extrusion boundary (those stay until the platform dies).
-    // Short TTL is the main fix for "lattice fills with scars → 5 FPS".
-    trailTtlMs: 2800,
-    // How often to sweep expired trails (cheap; can run frequently).
-    expireCheckMs: 200,
+    // Logic-only lifetime for closing diamonds. Scars are NOT drawn on the
+    // lattice by default — the red pulse is the visible trail; extrusions
+    // are the lasting mark. Keep this long enough that a loop can still form.
+    trailTtlMs: 1600,
+    // How often to sweep expired trails.
+    expireCheckMs: 100,
+    // When false, activated paths never stain the lattice — only extrusions
+    // and the live signal pulse remain visible.
+    drawScars: false,
   },
 
   // ---- Construction signal -----------------------------------------------
