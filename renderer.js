@@ -90,16 +90,8 @@ function pulseColorAt(u, headRgb, bodyStartRgb, bodyEndRgb, tailRgb, theme) {
   return [rgb[0], rgb[1], rgb[2], alpha];
 }
 
-/** Point-in-polygon test (ray casting). Boundary points count as inside. */
-function pointInPolygon(px, py, verts) {
-  // Treat vertices / near-boundary as inside so footprint perimeter edges cull.
-  const EPS = 0.75;
-  for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
-    if (distPointToSegment(px, py, verts[j].x, verts[j].y, verts[i].x, verts[i].y) <= EPS) {
-      return true;
-    }
-  }
-
+/** Fast point-in-polygon (ray cast only — no boundary distance). */
+function pointInPolygonFast(px, py, verts) {
   let inside = false;
   for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
     const xi = verts[i].x, yi = verts[i].y;
@@ -110,6 +102,18 @@ function pointInPolygon(px, py, verts) {
     }
   }
   return inside;
+}
+
+/** Point-in-polygon test (ray casting). Boundary points count as inside. */
+function pointInPolygon(px, py, verts) {
+  // Treat vertices / near-boundary as inside so footprint perimeter edges cull.
+  const EPS = 0.75;
+  for (let i = 0, j = verts.length - 1; i < verts.length; j = i++) {
+    if (distPointToSegment(px, py, verts[j].x, verts[j].y, verts[i].x, verts[i].y) <= EPS) {
+      return true;
+    }
+  }
+  return pointInPolygonFast(px, py, verts);
 }
 
 /** Distance from point to segment AB. */
@@ -186,6 +190,10 @@ function hexToRgb(hex) {
   ];
 }
 
+/** Empty shared constants — avoid allocating new Set/Array every frame. */
+const EMPTY_SET = new Set();
+const EMPTY_ARR = [];
+
 export class Renderer {
   /**
    * @param {import('p5')} p  The active p5 instance (instance mode).
@@ -231,27 +239,38 @@ export class Renderer {
    *
    * @param {Camera} camera
    * @param {{nodes: Array, edges: Array}} latticeData
-   * @param {Array} [surfaces]  Completed extrusions — used to clip hidden edges.
+   * @param {{ occludedEdgeKeys?: Set<string>, partialSurfaces?: Array }} [occlusion]
    */
-  render(camera, latticeData, surfaces = []) {
+  render(camera, latticeData, occlusion = {}) {
     const viewportHeight = camera.viewportHeight;
+    const occluded = occlusion.occludedEdgeKeys || EMPTY_SET;
+    const partialSurfaces = occlusion.partialSurfaces || EMPTY_ARR;
 
     this.clearBackground();
 
-    // Clip lattice edges against completed footprints so ground lines never
-    // show through solid side faces (edges are drawn before extrusions).
-    const footprints = this._buildExtrusionFootprints(surfaces);
+    // Fast path: fully expanded cells hide their four boundary edges via
+    // an O(1) Set lookup. Expensive polygon clipping runs only for the few
+    // cells still scaling in (partialSurfaces) — not for every extrusion.
+    const partialFootprints = this._buildExtrusionFootprints(partialSurfaces);
 
     const projectedEdges = this._projectedEdges;
     projectedEdges.length = 0;
 
     for (const edge of latticeData.edges) {
-      const visible = this._clipEdgeAgainstFootprints(
-        edge.x1, edge.y1, edge.x2, edge.y2, footprints
-      );
-      for (const seg of visible) {
-        const a = camera.worldToScreen(seg.x1, seg.y1);
-        const b = camera.worldToScreen(seg.x2, seg.y2);
+      if (edge.key && occluded.has(edge.key)) continue;
+
+      if (partialFootprints.length > 0) {
+        const visible = this._clipEdgeAgainstFootprints(
+          edge.x1, edge.y1, edge.x2, edge.y2, partialFootprints
+        );
+        for (const seg of visible) {
+          const a = camera.worldToScreen(seg.x1, seg.y1);
+          const b = camera.worldToScreen(seg.x2, seg.y2);
+          projectedEdges.push({ a, b, midY: (a.y + b.y) * 0.5 });
+        }
+      } else {
+        const a = camera.worldToScreen(edge.x1, edge.y1);
+        const b = camera.worldToScreen(edge.x2, edge.y2);
         projectedEdges.push({ a, b, midY: (a.y + b.y) * 0.5 });
       }
     }
@@ -331,8 +350,13 @@ export class Renderer {
    */
   drawSimulation(camera, simDrawData) {
     const vh = camera.viewportHeight;
-    const footprints = this._buildExtrusionFootprints(simDrawData.surfaces);
-    this._drawActivatedEdges(simDrawData.activatedEdges, camera, vh, footprints);
+    const occluded = simDrawData.occludedEdgeKeys || EMPTY_SET;
+    const partialFootprints = this._buildExtrusionFootprints(
+      simDrawData.partialSurfaces || EMPTY_ARR
+    );
+    this._drawActivatedEdges(
+      simDrawData.activatedEdges, camera, vh, occluded, partialFootprints
+    );
     this._drawSurfaces(simDrawData.surfaces, simDrawData.interiorEdges, camera, vh);
     this._drawSignals(simDrawData.signals, simDrawData.surfaces, camera, vh);
   }
@@ -386,19 +410,26 @@ export class Renderer {
     return segments;
   }
 
-  /** Activated edges — clipped against extrusion footprints like lattice edges. */
-  _drawActivatedEdges(edges, camera, viewportHeight, footprints = []) {
+  /** Activated edges — Set-cull fully hidden; clip only against scaling footprints. */
+  _drawActivatedEdges(edges, camera, viewportHeight, occluded = EMPTY_SET, partialFootprints = EMPTY_ARR) {
     const p = this.p;
     const [r, g, b] = this.activatedEdgeRgb;
     const baseWeight = Theme.activatedEdge.lineWidth;
 
     p.noFill();
     for (const edge of edges) {
-      const visible = this._clipEdgeAgainstFootprints(
-        edge.x1, edge.y1, edge.x2, edge.y2, footprints
-      );
+      if (edge.key && occluded.has(edge.key)) continue;
 
-      for (const seg of visible) {
+      let segments;
+      if (partialFootprints.length > 0) {
+        segments = this._clipEdgeAgainstFootprints(
+          edge.x1, edge.y1, edge.x2, edge.y2, partialFootprints
+        );
+      } else {
+        segments = [edge];
+      }
+
+      for (const seg of segments) {
         const a  = camera.worldToScreen(seg.x1, seg.y1);
         const b_ = camera.worldToScreen(seg.x2, seg.y2);
         const midY = (a.y + b_.y) * 0.5;
@@ -486,12 +517,17 @@ export class Renderer {
 
       const extrudePx = surface.heightPx * surface.extrusionScale;
       let topY = Infinity;
+      let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
       for (const v of footprint) {
         if (v.y < topY) topY = v.y;
+        if (v.x < minX) minX = v.x;
+        if (v.x > maxX) maxX = v.x;
+        if (v.y < minY) minY = v.y;
+        if (v.y > maxY) maxY = v.y;
       }
       topY -= extrudePx;
 
-      occluders.push({ footprint, topY });
+      occluders.push({ footprint, topY, minX, maxX, minY: topY, maxY });
     }
 
     return occluders;
@@ -500,7 +536,8 @@ export class Renderer {
   /** True when a screen point lies inside a solid platform's footprint below its top. */
   _isOccludedByPlatform(x, y, occluders) {
     for (const occ of occluders) {
-      if (!pointInPolygon(x, y, occ.footprint)) continue;
+      if (x < occ.minX || x > occ.maxX || y < occ.minY || y > occ.maxY) continue;
+      if (!pointInPolygonFast(x, y, occ.footprint)) continue;
       if (y >= occ.topY - 1) return true;
     }
     return false;
