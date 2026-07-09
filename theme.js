@@ -68,6 +68,12 @@ export const Theme = {
     // paths are legible without being loud.
     color: '#C5CAD0',
     lineWidth: 1.5,
+    // Trails are NOT permanent. After this TTL they fade unless they currently
+    // form a completed extrusion boundary (those stay until the platform dies).
+    // Short TTL is the main fix for "lattice fills with scars → 5 FPS".
+    trailTtlMs: 2800,
+    // How often to sweep expired trails (cheap; can run frequently).
+    expireCheckMs: 200,
   },
 
   // ---- Construction signal -----------------------------------------------
@@ -94,8 +100,8 @@ export const Theme = {
 
   // ---- Signal spawning schedule ------------------------------------------
   spawn: {
-    minIntervalMs: 2800,
-    maxIntervalMs: 5200,
+    minIntervalMs: 3200,
+    maxIntervalMs: 5800,
     // Hard cap — never spawn above this (prevents unbounded signal growth).
     maxConcurrent: 2,
   },
@@ -116,21 +122,18 @@ export const Theme = {
   // ---- Procedural world balance -------------------------------------------
   world: {
     // Working lattice radius — signals, activation, and occupancy stay inside.
-    // Critical for a fixed absolute background: without a bound, activated
-    // edges accumulate across an infinite lattice until the tab freezes.
-    activeCellRadius: 8,
-    minOccupancy: 0.28,
-    maxOccupancy: 0.42,
-    // Hard ceiling on simultaneous platforms (absolute background budget).
-    // Draw cost scales ~linearly with this — keep modest for a fixed embed.
-    maxCompletedCells: 24,
-    // Each completed platform lives 3.5–6 s before deconstruction begins.
-    lifetimeMinMs: 3500,
-    lifetimeMaxMs: 6000,
-    // How often to prune orphan activated edges outside the working radius.
-    edgePruneIntervalMs: 1500,
+    activeCellRadius: 7,
+    minOccupancy: 0.22,
+    maxOccupancy: 0.35,
+    // Hard ceiling on simultaneous platforms — fewer = much smoother.
+    maxCompletedCells: 12,
+    // Each completed platform lives 3–5 s before deconstruction begins.
+    lifetimeMinMs: 3000,
+    lifetimeMaxMs: 5000,
+    // Fallback prune (TTL expiry is the primary cleanup).
+    edgePruneIntervalMs: 800,
     // Absolute ceiling on remembered activated edges (draw + GC budget).
-    maxActivatedEdges: 160,
+    maxActivatedEdges: 48,
   },
 
   // ---- Runtime performance (fixed absolute background) --------------------
@@ -139,7 +142,7 @@ export const Theme = {
     targetFps: 30,
     // Skip drawing lattice nodes (dots) — edges carry the visual language.
     drawLatticeNodes: false,
-    // Signal trail subdivisions (was 6, then 3).
+    // Signal trail subdivisions.
     signalSubdivs: 2,
   },
 
