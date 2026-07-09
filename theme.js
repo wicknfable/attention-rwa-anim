@@ -37,7 +37,7 @@ export const Theme = {
     // How many extra rows/columns of lattice to draw beyond what is
     // strictly visible on screen, so panning/zooming never reveals a
     // hard edge. Expressed as a multiplier on the visible span.
-    overscanFactor: 1.5,
+    overscanFactor: 1.25,
   },
 
   // ---- Screen-space atmospheric depth effect -----------------------------
