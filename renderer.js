@@ -456,7 +456,7 @@ export class Renderer {
     const bodyStart = this.signalBodyStartRgb;
     const bodyEnd   = this.signalBodyEndRgb;
     const tailRgb   = this.signalTailRgb;
-    const SUBDIVS   = 6;
+    const SUBDIVS   = 3;
     const OPAQUE = 255;
 
     const occluders = this._buildPlatformOccluders(surfaces, camera);
