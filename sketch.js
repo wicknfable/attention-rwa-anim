@@ -124,7 +124,10 @@ export function createAttentionSketch(container) {
       // 3. Inactive lattice (background, visible edges, nodes).
       const visibleBounds = camera.getVisibleWorldBounds(Theme.grid.overscanFactor);
       const latticeData   = generateLatticeData(visibleBounds);
-      renderer.render(camera, latticeData, simDrawData.surfaces);
+      renderer.render(camera, latticeData, {
+        occludedEdgeKeys: simDrawData.occludedEdgeKeys,
+        partialSurfaces:   simDrawData.partialSurfaces,
+      });
 
       // 4. Simulation layer: activated edges → extrusions → signals.
       renderer.drawSimulation(camera, simDrawData);
