@@ -37,8 +37,12 @@ export const Theme = {
     // How many extra rows/columns of lattice to draw beyond what is
     // strictly visible on screen, so panning/zooming never reveals a
     // hard edge. Expressed as a multiplier on the visible span.
-    overscanFactor: 1.1,
+    overscanFactor: 1.05,
+
+    // Discrete depth bands for lattice stroke batching (fewer p5 state changes).
+    depthBands: 6,
   },
+
 
   // ---- Screen-space atmospheric depth effect -----------------------------
   depth: {
@@ -90,11 +94,12 @@ export const Theme = {
 
   // ---- Signal spawning schedule ------------------------------------------
   spawn: {
-    minIntervalMs: 2200,
-    maxIntervalMs: 4500,
+    minIntervalMs: 2800,
+    maxIntervalMs: 5200,
     // Hard cap — never spawn above this (prevents unbounded signal growth).
-    maxConcurrent: 3,
+    maxConcurrent: 2,
   },
+
 
   // ---- Completed surface appearance -------------------------------------
   surface: {
@@ -113,17 +118,31 @@ export const Theme = {
     // Working lattice radius — signals, activation, and occupancy stay inside.
     // Critical for a fixed absolute background: without a bound, activated
     // edges accumulate across an infinite lattice until the tab freezes.
-    activeCellRadius: 10,
-    minOccupancy: 0.35,
-    maxOccupancy: 0.50,
+    activeCellRadius: 8,
+    minOccupancy: 0.28,
+    maxOccupancy: 0.42,
     // Hard ceiling on simultaneous platforms (absolute background budget).
-    maxCompletedCells: 48,
-    // Each completed platform lives 4–7 s before deconstruction begins.
-    lifetimeMinMs: 4000,
-    lifetimeMaxMs: 7000,
+    // Draw cost scales ~linearly with this — keep modest for a fixed embed.
+    maxCompletedCells: 24,
+    // Each completed platform lives 3.5–6 s before deconstruction begins.
+    lifetimeMinMs: 3500,
+    lifetimeMaxMs: 6000,
     // How often to prune orphan activated edges outside the working radius.
-    edgePruneIntervalMs: 2000,
+    edgePruneIntervalMs: 1500,
+    // Absolute ceiling on remembered activated edges (draw + GC budget).
+    maxActivatedEdges: 160,
   },
+
+  // ---- Runtime performance (fixed absolute background) --------------------
+  performance: {
+    // 30 FPS is plenty for this ambient layer and halves CPU/GPU work.
+    targetFps: 30,
+    // Skip drawing lattice nodes (dots) — edges carry the visual language.
+    drawLatticeNodes: false,
+    // Signal trail subdivisions (was 6, then 3).
+    signalSubdivs: 2,
+  },
+
 
   // ---- Extrusion height levels (screen pixels) ----------------------------
   // Expressive skyline: mostly low, rare landmarks (weights in simulation).
