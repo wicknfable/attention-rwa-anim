@@ -201,8 +201,12 @@ export class Simulation {
   constructor() {
     // --- Permanent world state --------------------------------------------
 
-    /** Set of activated edge keys (strings). */
-    this.activatedEdgeKeys = new Set();
+    /**
+     * Activated lattice edges left by explorer signals.
+     * NOT permanent scars — each edge carries an expiry timestamp.
+     * Map: edgeKey → { x1,y1,x2,y2, key, expiresAt }
+     */
+    this.activatedEdges = new Map();
 
     /**
      * Map of completed cell key → cell record:
@@ -232,6 +236,7 @@ export class Simulation {
     this._firstSpawnDone  = false;
     this._simTimeMs       = 0;
     this._edgePruneTimerMs = 0;
+    this._edgeExpireTimerMs = 0;
     this._occupancyTimerMs = 0;
 
     /**
@@ -242,8 +247,7 @@ export class Simulation {
     this._deferredCells = new Set();
 
     // --- Draw-data caches (avoid per-frame allocation storms) --------------
-    /** @type {Map<string, {x1:number,y1:number,x2:number,y2:number,key:string}>} */
-    this._activatedEdgeGeom = new Map();
+    this._activatedEdgeList = [];
     this._drawSurfaces = [];
     this._drawInteriorEdges = [];
     this._drawPartialSurfaces = [];
@@ -275,6 +279,13 @@ export class Simulation {
       this._occupancyTimerMs = 0;
       this._manageWorldOccupancy();
       this._retryDeferredCompletions();
+    }
+
+    // Primary cleanup: trails die after trailTtlMs unless pinning a platform.
+    this._edgeExpireTimerMs += dt;
+    if (this._edgeExpireTimerMs >= (Theme.activatedEdge.expireCheckMs || 200)) {
+      this._edgeExpireTimerMs = 0;
+      this._expireActivatedEdges();
     }
 
     this._edgePruneTimerMs += dt;
@@ -422,7 +433,7 @@ export class Simulation {
       if (ni === prevNode.i && nj === prevNode.j) continue;
 
       const key = edgeKey(i, j, ni, nj);
-      (this.activatedEdgeKeys.has(key) ? activated : unactivated).push({ i: ni, j: nj });
+      (this.activatedEdges.has(key) ? activated : unactivated).push({ i: ni, j: nj });
     }
 
     const pool = unactivated.length > 0 ? unactivated : activated;
@@ -444,19 +455,45 @@ export class Simulation {
     }
 
     const key = edgeKey(fromNode.i, fromNode.j, toNode.i, toNode.j);
-    if (this.activatedEdgeKeys.has(key)) return;
+    const ttl = Theme.activatedEdge.trailTtlMs || 2800;
+    const expiresAt = this._simTimeMs + ttl;
 
-    this.activatedEdgeKeys.add(key);
-    const a = latticeNodeWorldPosition(fromNode.i, fromNode.j);
-    const b = latticeNodeWorldPosition(toNode.i, toNode.j);
-    this._activatedEdgeGeom.set(key, {
-      x1: a.x, y1: a.y, x2: b.x, y2: b.y, key,
-    });
+    const existing = this.activatedEdges.get(key);
+    if (existing) {
+      // Refresh TTL so recently-travelled trails stay visible / completable.
+      existing.expiresAt = expiresAt;
+    } else {
+      // Hard budget — drop a random expired-eligible edge before growing.
+      const maxEdges = Theme.world.maxActivatedEdges || 48;
+      if (this.activatedEdges.size >= maxEdges) {
+        this._dropOldestExpirableEdge();
+      }
+
+      const a = latticeNodeWorldPosition(fromNode.i, fromNode.j);
+      const b = latticeNodeWorldPosition(toNode.i, toNode.j);
+      this.activatedEdges.set(key, {
+        x1: a.x, y1: a.y, x2: b.x, y2: b.y, key, expiresAt,
+      });
+    }
 
     const cellsToCheck = this._cellsAdjacentToEdge(fromNode, toNode);
     for (const [ci, cj] of cellsToCheck) {
       this._checkAndCompleteCell(ci, cj);
     }
+  }
+
+  /** Removes one trail that is not currently pinning a completed cell. */
+  _dropOldestExpirableEdge() {
+    let oldestKey = null;
+    let oldestExp = Infinity;
+    for (const [key, edge] of this.activatedEdges) {
+      if (this._edgeRequiredByCompletedCell(key)) continue;
+      if (edge.expiresAt < oldestExp) {
+        oldestExp = edge.expiresAt;
+        oldestKey = key;
+      }
+    }
+    if (oldestKey) this.activatedEdges.delete(oldestKey);
   }
 
   /**
@@ -499,7 +536,7 @@ export class Simulation {
     }
 
     const edges = cellEdgeKeys(ci, cj);
-    const allActive = edges.every(e => this.activatedEdgeKeys.has(e));
+    const allActive = edges.every(e => this.activatedEdges.has(e));
     if (!allActive) {
       this._deferredCells.delete(key);
       return;
@@ -548,6 +585,14 @@ export class Simulation {
       heightPx: this._clusterHeights.get(myRoot),
       completedAt: this._simTimeMs,
     });
+
+    // Pin boundary edges for the platform's life — TTL expiry must not
+    // dissolve a closed diamond while the extrusion is still standing.
+    const pinUntil = this._simTimeMs + (Theme.world.lifetimeMaxMs || 5000) + 4000;
+    for (const eKey of edges) {
+      const edge = this.activatedEdges.get(eKey);
+      if (edge && edge.expiresAt < pinUntil) edge.expiresAt = pinUntil;
+    }
   }
 
   /**
@@ -764,22 +809,43 @@ export class Simulation {
   }
 
   /**
-   * Drops activated edges that are no longer needed and sit outside the
-   * working radius — or orphan edges not bordering any completed cell.
-   * Without this, activatedEdgeKeys grows without bound and freezes the tab.
+   * Primary cleanup: drop trails whose TTL elapsed, unless they currently
+   * form the boundary of a live extrusion. This is what stops the lattice
+   * filling with permanent scars and killing frame rate.
+   */
+  _expireActivatedEdges() {
+    const now = this._simTimeMs;
+    const toDelete = [];
+
+    for (const [key, edge] of this.activatedEdges) {
+      if (edge.expiresAt > now) continue;
+      // Keep edges that still pin a completed/collapsing platform.
+      if (this._edgeRequiredByCompletedCell(key)) {
+        // Stretch expiry so we don't re-check as often while pinned.
+        edge.expiresAt = now + 1000;
+        continue;
+      }
+      toDelete.push(key);
+    }
+
+    for (const key of toDelete) {
+      this.activatedEdges.delete(key);
+    }
+  }
+
+  /**
+   * Secondary cleanup: radius + hard budget. TTL expiry does most of the work.
    */
   _pruneActivatedEdges() {
     const R = Theme.world.activeCellRadius;
     const keep = new Set();
 
-    // Edges that form completed (or collapsing) cell boundaries must stay.
     for (const cell of this.completedCells.values()) {
       for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
         keep.add(eKey);
       }
     }
 
-    // Edges currently under an active signal trail stay.
     for (const signal of this.signals) {
       const nodes = signal.trailNodes;
       for (let i = 1; i < nodes.length; i++) {
@@ -791,7 +857,7 @@ export class Simulation {
       ));
     }
 
-    for (const key of this.activatedEdgeKeys) {
+    for (const key of this.activatedEdges.keys()) {
       if (keep.has(key)) continue;
 
       const { i1, j1, i2, j2 } = parseEdgeKey(key);
@@ -799,32 +865,29 @@ export class Simulation {
         Math.abs(i1) > R || Math.abs(j1) > R ||
         Math.abs(i2) > R || Math.abs(j2) > R;
 
-      // Drop outside edges always; drop orphan interior edges not needed
-      // by any live cell (they only exist to seed future loops — safe to
-      // clear periodically so the set stays bounded).
-      if (outside || !this._edgeRequiredByCompletedCell(key)) {
-        // Keep a small fraction of in-radius orphans so loops can still form.
-        if (!outside && Math.random() < 0.25) continue;
-        this.activatedEdgeKeys.delete(key);
-        this._activatedEdgeGeom.delete(key);
+      if (outside) {
+        this.activatedEdges.delete(key);
       }
     }
 
-    // Cap deferred set size.
-    if (this._deferredCells.size > 64) {
+    if (this._deferredCells.size > 32) {
       this._deferredCells.clear();
     }
 
-    // Hard ceiling — if still over budget, drop oldest orphans first.
-    const maxEdges = Theme.world.maxActivatedEdges || 160;
-    if (this.activatedEdgeKeys.size > maxEdges) {
-      const excess = this.activatedEdgeKeys.size - maxEdges;
+    const maxEdges = Theme.world.maxActivatedEdges || 48;
+    if (this.activatedEdges.size > maxEdges) {
+      const excess = this.activatedEdges.size - maxEdges;
       let dropped = 0;
-      for (const key of this.activatedEdgeKeys) {
+      // Prefer dropping soonest-to-expire unpinned edges.
+      const candidates = [];
+      for (const [key, edge] of this.activatedEdges) {
         if (keep.has(key)) continue;
-        this.activatedEdgeKeys.delete(key);
-        this._activatedEdgeGeom.delete(key);
-        if (++dropped >= excess) break;
+        candidates.push({ key, expiresAt: edge.expiresAt });
+      }
+      candidates.sort((a, b) => a.expiresAt - b.expiresAt);
+      for (let i = 0; i < candidates.length && dropped < excess; i++) {
+        this.activatedEdges.delete(candidates[i].key);
+        dropped++;
       }
     }
   }
@@ -833,11 +896,13 @@ export class Simulation {
     const key = cellKey(cell.ci, cell.cj);
     this.completedCells.delete(key);
 
+    const ttl = Theme.activatedEdge.trailTtlMs || 2800;
     for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
-      if (!this._edgeRequiredByCompletedCell(eKey)) {
-        this.activatedEdgeKeys.delete(eKey);
-        this._activatedEdgeGeom.delete(eKey);
-      }
+      if (this._edgeRequiredByCompletedCell(eKey)) continue;
+      const edge = this.activatedEdges.get(eKey);
+      if (!edge) continue;
+      // Platform gone — let the trail die soon instead of lingering forever.
+      edge.expiresAt = Math.min(edge.expiresAt, this._simTimeMs + Math.min(800, ttl * 0.35));
     }
 
     const root = this._uf.find(key);
@@ -884,12 +949,9 @@ export class Simulation {
   // -------------------------------------------------------------------------
 
   _buildActivatedEdgeGeometry() {
-    // Geometry is stored at activation time — no parse/project every frame.
-    // Reuse one array so we don't allocate thousands of entries of GC pressure.
-    if (!this._activatedEdgeList) this._activatedEdgeList = [];
     const result = this._activatedEdgeList;
     result.length = 0;
-    for (const geom of this._activatedEdgeGeom.values()) {
+    for (const geom of this.activatedEdges.values()) {
       result.push(geom);
     }
     return result;
@@ -933,8 +995,6 @@ export class Simulation {
 
       if (animScale <= 0) continue;
 
-      // Fully expanded cells: O(1) cull of their four boundary edges.
-      // Scaling cells: expensive polygon clip only for these few footprints.
       if (animScale >= 0.98) {
         for (const eKey of cellEdgeKeys(cell.ci, cell.cj)) {
           occludedEdgeKeys.add(eKey);
@@ -970,7 +1030,7 @@ export class Simulation {
 
         if (!seenInterior.has(eKey)) {
           seenInterior.add(eKey);
-          const geom = this._activatedEdgeGeom.get(eKey);
+          const geom = this.activatedEdges.get(eKey);
           if (geom) {
             interiorEdges.push(geom);
           } else {
