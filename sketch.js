@@ -3,6 +3,11 @@
  * ------------------------------------------------------------------------
  * Application entry point — orchestration only.
  *
+ * Pause conditions (any one stops the loop; state is kept):
+ *   - Page scrolled past Theme.lifecycle.scrollPauseAt (default 20%)
+ *   - Host leaves viewport (IntersectionObserver)
+ *   - Browser tab hidden (Page Visibility API)
+ *
  * Lifecycle (one-way showcase mode):
  *   1. Bake lattice once → CSS background on the host (static, free)
  *   2. Animate signals + extrusions on a transparent canvas overlay
@@ -42,12 +47,15 @@ export function createAttentionSketch(container) {
     let running = true;
     let inViewport = true;
     let pageVisible = !document.hidden;
+    let scrollAllows = true;
     let bakedFinal = false;
 
     /** @type {ResizeObserver|null} */
     let resizeObserver = null;
     /** @type {IntersectionObserver|null} */
     let intersectionObserver = null;
+    /** @type {number|null} */
+    let scrollRaf = null;
 
     /** @type {{ edges: Array, nodes: Array, bandCount: number } | null} */
     let screenLattice = null;
@@ -56,6 +64,34 @@ export function createAttentionSketch(container) {
       pageVisible = !document.hidden;
       syncLoop();
     };
+
+    const onScrollOrResize = () => {
+      if (bakedFinal) return;
+      if (scrollRaf != null) return;
+      scrollRaf = requestAnimationFrame(() => {
+        scrollRaf = null;
+        updateScrollGate();
+      });
+    };
+
+    function updateScrollGate() {
+      const life = Theme.lifecycle || {};
+      const threshold = life.scrollPauseAt;
+      if (threshold == null || threshold === false) {
+        scrollAllows = true;
+        syncLoop();
+        return;
+      }
+
+      const past = getPageScrollProgress() >= Number(threshold);
+      if (past) {
+        scrollAllows = false;
+      } else if (life.scrollResume !== false) {
+        scrollAllows = true;
+      }
+      // scrollResume === false: once past threshold, stay paused.
+      syncLoop();
+    }
 
     function rebuildScreenLattice() {
       const visibleBounds = camera.getVisibleWorldBounds(Theme.grid.overscanFactor);
@@ -97,6 +133,9 @@ export function createAttentionSketch(container) {
       }
 
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('scroll', onScrollOrResize, true);
+      window.removeEventListener('resize', onScrollOrResize);
+      if (scrollRaf != null) cancelAnimationFrame(scrollRaf);
       if (resizeObserver) resizeObserver.disconnect();
       if (intersectionObserver) intersectionObserver.disconnect();
     }
@@ -109,9 +148,16 @@ export function createAttentionSketch(container) {
       canvas.parent(host);
 
       if (canvas.elt) {
-        canvas.elt.style.pointerEvents = 'none';
-        canvas.elt.style.display = 'block';
-        canvas.elt.style.background = 'transparent';
+        const el = canvas.elt;
+        el.style.pointerEvents = 'none';
+        el.style.display = 'block';
+        el.style.background = 'transparent';
+        el.style.position = 'absolute';
+        el.style.inset = '0';
+        el.style.width = '100%';
+        el.style.height = '100%';
+        el.style.zIndex = '0';
+        el.setAttribute('aria-hidden', 'true');
       }
 
       const cameraOffsetX = width * 0.10;
@@ -149,6 +195,11 @@ export function createAttentionSketch(container) {
       }
 
       document.addEventListener('visibilitychange', onVisibilityChange);
+      // Capture so we still see scroll on nested/Webflow scroll containers
+      // that bubble to window; also listen on documentElement as fallback.
+      window.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
+      window.addEventListener('resize', onScrollOrResize, { passive: true });
+      updateScrollGate();
     };
 
     p.draw = () => {
@@ -177,7 +228,7 @@ export function createAttentionSketch(container) {
 
     function syncLoop() {
       if (bakedFinal) return;
-      const shouldRun = inViewport && pageVisible;
+      const shouldRun = inViewport && pageVisible && scrollAllows;
       if (shouldRun === running) return;
       running = shouldRun;
       if (running) {
@@ -189,6 +240,9 @@ export function createAttentionSketch(container) {
 
     p._attentionTeardown = () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('scroll', onScrollOrResize, true);
+      window.removeEventListener('resize', onScrollOrResize);
+      if (scrollRaf != null) cancelAnimationFrame(scrollRaf);
       if (resizeObserver) resizeObserver.disconnect();
       if (intersectionObserver) intersectionObserver.disconnect();
     };
@@ -197,21 +251,76 @@ export function createAttentionSketch(container) {
   return new p5(sketch, host);
 }
 
+/**
+ * Fraction of page scroll progress in [0, 1].
+ * Uses (scrollTop) / (scrollHeight − clientHeight).
+ */
+function getPageScrollProgress() {
+  const el = document.scrollingElement || document.documentElement;
+  const scrollTop = el.scrollTop || window.pageYOffset || 0;
+  const max = Math.max(1, el.scrollHeight - el.clientHeight);
+  return Math.min(1, Math.max(0, scrollTop / max));
+}
+
 function applyLatticeBackground(host, dataUrl) {
-  host.style.backgroundImage = `url(${dataUrl})`;
-  host.style.backgroundSize = '100% 100%';
-  host.style.backgroundPosition = 'center';
-  host.style.backgroundRepeat = 'no-repeat';
-  host.style.backgroundColor = Theme.color.background;
+  // Prefer a dedicated backdrop child so we never fight Webflow section
+  // backgrounds or paint over sibling hero UI via stacking quirks.
+  const layer = ensureBackdrop(host);
+  layer.style.backgroundImage = `url(${dataUrl})`;
+  layer.style.backgroundSize = '100% 100%';
+  layer.style.backgroundPosition = 'center';
+  layer.style.backgroundRepeat = 'no-repeat';
+  layer.style.backgroundColor = Theme.color.background;
+}
+
+function ensureBackdrop(host) {
+  let layer = host.querySelector('[data-attention-backdrop]');
+  if (!layer) {
+    layer = document.createElement('div');
+    layer.setAttribute('data-attention-backdrop', '');
+    layer.setAttribute('aria-hidden', 'true');
+    Object.assign(layer.style, {
+      position: 'absolute',
+      inset: '0',
+      zIndex: '0',
+      pointerEvents: 'none',
+      backgroundSize: '100% 100%',
+      backgroundPosition: 'center',
+      backgroundRepeat: 'no-repeat',
+    });
+    host.insertBefore(layer, host.firstChild);
+  }
+  return layer;
 }
 
 function ensureHostStyle(host) {
+  host.setAttribute('data-attention-rwa', '');
   const style = host.style;
-  if (!style.position || style.position === 'static') {
-    // Keep existing absolute/fixed from Webflow; only set relative as fallback.
-    if (getComputedStyle(host).position === 'static') {
-      style.position = 'relative';
-    }
+  style.pointerEvents = 'none';
+
+  const computed = getComputedStyle(host);
+  if (computed.position === 'static') {
+    style.position = 'absolute';
+  }
+  // Fill parent (typical Webflow absolute background layer).
+  if (!style.inset && !style.top && !style.left) {
+    style.top = '0';
+    style.left = '0';
+    style.right = '0';
+    style.bottom = '0';
+  }
+  if (!style.width && computed.width === 'auto') {
+    style.width = '100%';
+  }
+  if (!style.height && (computed.height === 'auto' || computed.height === '0px')) {
+    style.height = '100%';
+  }
+  // Stay behind hero UI. Content wrappers should use z-index: 1+.
+  if (!style.zIndex) {
+    style.zIndex = '0';
+  }
+  if (computed.overflow === 'visible') {
+    style.overflow = 'hidden';
   }
 }
 
