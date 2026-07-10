@@ -240,6 +240,11 @@ export class Simulation {
     this._edgeExpireTimerMs = 0;
     this._occupancyTimerMs = 0;
 
+    /** One-way lifecycle: construction → freeze → bake (no collapse). */
+    this.frozen = false;
+    this._freezeRequested = false;
+    this._settleTimerMs = 0;
+
     /**
      * Cells whose four edges are closed but which were deferred because a
      * completed extrusion already occupies the isometric foreground.
@@ -269,17 +274,39 @@ export class Simulation {
     // Clamp huge frame gaps (tab resume) so simulation doesn't explode.
     const dt = Math.min(deltaMs, 50);
 
+    if (this.frozen) return;
+
     this._simTimeMs += dt;
+
+    // Freeze path: stop spawning/signals, let in-flight extrusions finish, then settle.
+    if (this._freezeRequested) {
+      this._updateSurfaceAnimations(dt);
+      this._settleTimerMs += dt;
+      const settleMs = Theme.lifecycle?.settleMs ?? 1500;
+      if (this._allSurfacesSettled() && this._settleTimerMs >= settleMs) {
+        this.frozen = true;
+        this.signals = [];
+      }
+      return;
+    }
+
     this._trySpawnSignal(dt);
     this._updateSignals(dt);
     this._updateSurfaceAnimations(dt);
-    this._checkPlatformLifetimes();
+
+    const oneWay = Theme.lifecycle?.oneWay !== false;
+    if (!oneWay) {
+      this._checkPlatformLifetimes();
+    }
 
     this._occupancyTimerMs += dt;
     if (this._occupancyTimerMs >= 400) {
       this._occupancyTimerMs = 0;
-      this._manageWorldOccupancy();
+      if (!oneWay) {
+        this._manageWorldOccupancy();
+      }
       this._retryDeferredCompletions();
+      this._maybeRequestFreeze();
     }
 
     // Primary cleanup: trails die after trailTtlMs unless pinning a platform.
@@ -294,6 +321,44 @@ export class Simulation {
       this._edgePruneTimerMs = 0;
       this._pruneActivatedEdges();
     }
+  }
+
+  /** True when the animation should stop and be baked as a static image. */
+  isFrozen() {
+    return this.frozen;
+  }
+
+  /** True once fill target hit and settle window is complete. */
+  isReadyToBake() {
+    return this.frozen;
+  }
+
+  getOccupancy() {
+    return this._computeOccupancy();
+  }
+
+  _maybeRequestFreeze() {
+    const life = Theme.lifecycle;
+    if (!life || life.oneWay === false) return;
+    if (this._freezeRequested || this.frozen) return;
+
+    const occupancy = this._computeOccupancy();
+    const cells = this.completedCells.size;
+    const atOcc = occupancy >= (life.freezeOccupancy ?? 0.35);
+    const atCells = cells >= (life.freezeAtCells ?? 28);
+
+    if (atOcc || atCells) {
+      this._freezeRequested = true;
+      this._settleTimerMs = 0;
+      this.signals = [];
+    }
+  }
+
+  _allSurfacesSettled() {
+    for (const cell of this.completedCells.values()) {
+      if (cell.phase !== 'done') return false;
+    }
+    return true;
   }
 
   /**
@@ -591,7 +656,9 @@ export class Simulation {
 
     // Pin boundary edges for the platform's life — TTL expiry must not
     // dissolve a closed diamond while the extrusion is still standing.
-    const pinUntil = this._simTimeMs + (Theme.world.lifetimeMaxMs || 5000) + 4000;
+    const pinUntil = Theme.lifecycle?.oneWay !== false
+      ? this._simTimeMs + 1e12
+      : this._simTimeMs + (Theme.world.lifetimeMaxMs || 5000) + 4000;
     for (const eKey of edges) {
       const edge = this.activatedEdges.get(eKey);
       if (edge && edge.expiresAt < pinUntil) edge.expiresAt = pinUntil;
@@ -717,9 +784,12 @@ export class Simulation {
           if (cell.extrusionProgress >= 1) {
             cell.phase = 'done';
             cell.completedAt = this._simTimeMs;
-            const { lifetimeMinMs, lifetimeMaxMs } = Theme.world;
-            cell.expiresAt = this._simTimeMs + lifetimeMinMs +
-              Math.random() * (lifetimeMaxMs - lifetimeMinMs);
+            // One-way mode: platforms stay forever. Otherwise schedule collapse.
+            if (Theme.lifecycle?.oneWay === false) {
+              const { lifetimeMinMs, lifetimeMaxMs } = Theme.world;
+              cell.expiresAt = this._simTimeMs + lifetimeMinMs +
+                Math.random() * (lifetimeMaxMs - lifetimeMinMs);
+            }
           }
           break;
 
