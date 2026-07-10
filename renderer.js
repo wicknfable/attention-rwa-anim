@@ -347,8 +347,9 @@ export class Renderer {
    *
    * @param {Camera} camera
    * @param {{ activatedEdges, signals, surfaces, interiorEdges }} simDrawData
+   * @param {{ skipSignals?: boolean }} [opts]
    */
-  drawSimulation(camera, simDrawData) {
+  drawSimulation(camera, simDrawData, opts = {}) {
     const vh = camera.viewportHeight;
     const occluded = simDrawData.occludedEdgeKeys || EMPTY_SET;
     // Partial footprints are rare (only cells mid scale-in). Skip clip work
@@ -367,7 +368,69 @@ export class Renderer {
     }
 
     this._drawSurfaces(simDrawData.surfaces, simDrawData.interiorEdges, camera, vh);
-    this._drawSignals(simDrawData.signals, simDrawData.surfaces, camera, vh);
+    if (!opts.skipSignals) {
+      this._drawSignals(simDrawData.signals, simDrawData.surfaces, camera, vh);
+    }
+  }
+
+  /**
+   * Clears the main canvas to transparent so a CSS-baked lattice underneath
+   * shows through — avoids full-canvas opaque background + image blit every frame.
+   */
+  clearTransparent() {
+    const p = this.p;
+    p.clear();
+  }
+
+  /**
+   * Ensures the offscreen lattice layer exists and returns a PNG data URL
+   * suitable for CSS `background-image` on the host (baked once per resize).
+   */
+  bakeLatticeDataUrl(screenLattice) {
+    const w = this.p.width;
+    const h = this.p.height;
+    const cacheKey = `${w}x${h}|${screenLattice.edges.length}|${screenLattice.bandCount}|css`;
+    this._rebuildLatticeLayer(screenLattice, w, h, cacheKey);
+
+    const g = this._latticeGfx;
+    // Composite lattice onto themed background for CSS bake.
+    const baked = this.p.createGraphics(w, h);
+    baked.pixelDensity(1);
+    const [br, bg, bb] = this.backgroundRgb;
+    baked.background(br, bg, bb);
+    baked.image(g, 0, 0);
+    const url = baked.canvas.toDataURL('image/png');
+    baked.remove();
+    return url;
+  }
+
+  /**
+   * Final freeze: opaque background + lattice + settled extrusions → PNG.
+   * Used once when the one-way build reaches its fill target.
+   */
+  bakeFinalDataUrl(screenLattice, camera, simDrawData) {
+    const w = this.p.width;
+    const h = this.p.height;
+    this._rebuildLatticeLayer(
+      screenLattice, w, h,
+      `${w}x${h}|${screenLattice.edges.length}|final`
+    );
+
+    const baked = this.p.createGraphics(w, h);
+    baked.pixelDensity(1);
+    const [br, bg, bb] = this.backgroundRgb;
+    baked.background(br, bg, bb);
+    baked.image(this._latticeGfx, 0, 0);
+
+    // Temporarily redirect drawing to the bake buffer.
+    const main = this.p;
+    this.p = baked;
+    this.drawSimulation(camera, simDrawData, { skipSignals: true });
+    this.p = main;
+
+    const url = baked.canvas.toDataURL('image/png');
+    baked.remove();
+    return url;
   }
 
   /**
