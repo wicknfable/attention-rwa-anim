@@ -103,9 +103,9 @@ export const Theme = {
 
   // ---- Signal spawning schedule ------------------------------------------
   spawn: {
-    minIntervalMs: 1800,
-    maxIntervalMs: 3200,
-    // Slightly more concurrent while building — animation is short-lived.
+    // Slightly denser during the short live window so the skyline reads.
+    minIntervalMs: 1200,
+    maxIntervalMs: 2400,
     maxConcurrent: 3,
   },
 
@@ -138,26 +138,22 @@ export const Theme = {
     maxActivatedEdges: 64,
   },
 
-  // ---- One-shot lifecycle (client showcase / fixed background) ------------
-  // Construction only — no deconstruction. Animate until fill target, then
-  // freeze forever as a baked static image (zero ongoing CPU).
+  // ---- One-shot client showcase -------------------------------------------
+  // Live p5 for a few seconds → settle → bake static PNG → tear down.
+  // After bake the page costs ~0 CPU. Occupancy freeze is a backup only.
   lifecycle: {
     oneWay: true,
-    // Freeze when this fraction of working-radius cells are platforms.
-    freezeOccupancy: 0.35,
-    // Backup cell count (~35% of radius-7 grid ≈ 225 cells).
-    freezeAtCells: 70,
-    // After freeze: wait for in-flight extrusions to finish rising, then bake.
-    settleMs: 1800,
-    // Pause when page scroll progress reaches this fraction (0–1).
-    // 0.2 = 20% of scrollable document height. Set null/false to disable.
-    scrollPauseAt: 0.20,
-    // If true, scrolling back above the threshold resumes the animation.
-    // If false, once paused by scroll it stays stopped until occupancy bake.
-    scrollResume: true,
-    // When scroll-paused, hide the host so an absolute/fixed hero layer
-    // cannot show through lower-z-index sections further down the page.
-    hideWhenScrollPaused: true,
+    // Primary: how long the live animation runs before freeze begins.
+    liveDurationMs: 8000,
+    // After freeze: let in-flight extrusions finish rising, then bake.
+    settleMs: 1200,
+    // Backup freeze if the skyline fills early (whichever comes first).
+    freezeOccupancy: 0.40,
+    freezeAtCells: 80,
+    // Scroll pause disabled — unreliable in Webflow; timed bake is the path.
+    scrollPauseAt: null,
+    scrollResume: false,
+    hideWhenScrollPaused: false,
   },
 
   // ---- Runtime performance (fixed absolute background) --------------------
