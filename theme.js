@@ -149,6 +149,12 @@ export const Theme = {
     freezeAtCells: 70,
     // After freeze: wait for in-flight extrusions to finish rising, then bake.
     settleMs: 1800,
+    // Pause when page scroll progress reaches this fraction (0–1).
+    // 0.2 = 20% of (document height − viewport). Set null/false to disable.
+    scrollPauseAt: 0.20,
+    // If true, scrolling back above the threshold resumes the animation.
+    // If false, once paused by scroll it stays stopped until occupancy bake.
+    scrollResume: true,
   },
 
   // ---- Runtime performance (fixed absolute background) --------------------
