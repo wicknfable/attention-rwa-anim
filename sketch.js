@@ -79,18 +79,38 @@ export function createAttentionSketch(container) {
       const threshold = life.scrollPauseAt;
       if (threshold == null || threshold === false) {
         scrollAllows = true;
+        applyScrollVisibility(true);
         syncLoop();
         return;
       }
 
-      const past = getPageScrollProgress() >= Number(threshold);
+      const progress = getPageScrollProgress();
+      const past = progress >= Number(threshold);
+
       if (past) {
         scrollAllows = false;
       } else if (life.scrollResume !== false) {
         scrollAllows = true;
       }
       // scrollResume === false: once past threshold, stay paused.
+
+      applyScrollVisibility(scrollAllows);
       syncLoop();
+    }
+
+    /** Hide absolute/fixed host when scroll-paused so it can't bleed through. */
+    function applyScrollVisibility(allowed) {
+      if (Theme.lifecycle?.hideWhenScrollPaused === false) return;
+      if (bakedFinal) return;
+      host.style.visibility = allowed ? '' : 'hidden';
+      // Also hide live canvas explicitly (some Webflow stacks ignore parent visibility).
+      if (p.canvas) {
+        p.canvas.style.visibility = allowed ? '' : 'hidden';
+      }
+      const backdrop = host.querySelector('[data-attention-backdrop]');
+      if (backdrop) {
+        backdrop.style.visibility = allowed ? '' : 'hidden';
+      }
     }
 
     function rebuildScreenLattice() {
@@ -134,10 +154,12 @@ export function createAttentionSketch(container) {
 
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('scroll', onScrollOrResize, true);
+      document.removeEventListener('scroll', onScrollOrResize, true);
       window.removeEventListener('resize', onScrollOrResize);
       if (scrollRaf != null) cancelAnimationFrame(scrollRaf);
       if (resizeObserver) resizeObserver.disconnect();
       if (intersectionObserver) intersectionObserver.disconnect();
+      host.style.visibility = '';
     }
 
     p.setup = () => {
@@ -195,15 +217,21 @@ export function createAttentionSketch(container) {
       }
 
       document.addEventListener('visibilitychange', onVisibilityChange);
-      // Capture so we still see scroll on nested/Webflow scroll containers
-      // that bubble to window; also listen on documentElement as fallback.
+      // Capture phase + document: Webflow/Lenis often scroll a nested root
+      // or transform the page without reliable window scrollTop alone.
       window.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
+      document.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
       window.addEventListener('resize', onScrollOrResize, { passive: true });
       updateScrollGate();
     };
 
     p.draw = () => {
-      if (!running || bakedFinal) return;
+      if (bakedFinal) return;
+
+      // Per-frame scroll check — does not rely on scroll events (Webflow/smooth-scroll).
+      updateScrollGate();
+
+      if (!running) return;
       if (!screenLattice) rebuildScreenLattice();
 
       simulation.update(p.deltaTime);
@@ -235,14 +263,34 @@ export function createAttentionSketch(container) {
         p.loop();
       } else {
         p.noLoop();
+        // Keep a cheap poll alive so scroll-back can resume even after noLoop.
+        // (Webflow may not fire scroll events we hear; rAF poll covers that.)
+        startScrollPoll();
       }
+    }
+
+    /** Lightweight rAF poll while paused — catches scroll without a draw loop. */
+    let scrollPollRaf = null;
+    function startScrollPoll() {
+      if (scrollPollRaf != null || bakedFinal) return;
+      const tick = () => {
+        scrollPollRaf = null;
+        if (bakedFinal || running) return;
+        updateScrollGate();
+        if (!running) {
+          scrollPollRaf = requestAnimationFrame(tick);
+        }
+      };
+      scrollPollRaf = requestAnimationFrame(tick);
     }
 
     p._attentionTeardown = () => {
       document.removeEventListener('visibilitychange', onVisibilityChange);
       window.removeEventListener('scroll', onScrollOrResize, true);
+      document.removeEventListener('scroll', onScrollOrResize, true);
       window.removeEventListener('resize', onScrollOrResize);
       if (scrollRaf != null) cancelAnimationFrame(scrollRaf);
+      if (scrollPollRaf != null) cancelAnimationFrame(scrollPollRaf);
       if (resizeObserver) resizeObserver.disconnect();
       if (intersectionObserver) intersectionObserver.disconnect();
     };
@@ -252,14 +300,84 @@ export function createAttentionSketch(container) {
 }
 
 /**
- * Fraction of page scroll progress in [0, 1].
- * Uses (scrollTop) / (scrollHeight − clientHeight).
+ * Best-effort page scroll progress in [0, 1].
+ * Prefer window/document scrollY. Also reads CSS translateY on common
+ * smooth-scroll wrappers (Lenis / Locomotive / Webflow IX) where scrollY
+ * can stay near 0 while the page visually moves.
  */
+let _nestedScrollCache = 0;
+let _nestedScrollSampleAt = 0;
+
 function getPageScrollProgress() {
-  const el = document.scrollingElement || document.documentElement;
-  const scrollTop = el.scrollTop || window.pageYOffset || 0;
-  const max = Math.max(1, el.scrollHeight - el.clientHeight);
-  return Math.min(1, Math.max(0, scrollTop / max));
+  const now = performance.now();
+  if (now - _nestedScrollSampleAt > 250) {
+    _nestedScrollSampleAt = now;
+    _nestedScrollCache = Math.max(findNestedScrollY(), findTransformScrollY());
+  }
+
+  const doc = document.documentElement;
+  const body = document.body;
+  const scrollY = Math.max(
+    window.scrollY || 0,
+    window.pageYOffset || 0,
+    doc ? doc.scrollTop : 0,
+    body ? body.scrollTop : 0,
+    _nestedScrollCache
+  );
+
+  const viewH = window.innerHeight || (doc && doc.clientHeight) || 1;
+  const docH = Math.max(
+    doc ? doc.scrollHeight : 0,
+    doc ? doc.offsetHeight : 0,
+    body ? body.scrollHeight : 0,
+    body ? body.offsetHeight : 0,
+    viewH
+  );
+  const max = Math.max(1, docH - viewH);
+  return Math.min(1, Math.max(0, scrollY / max));
+}
+
+function findNestedScrollY() {
+  let best = 0;
+  const candidates = [
+    document.scrollingElement,
+    document.documentElement,
+    document.body,
+    document.querySelector('[data-scroll-container]'),
+    document.querySelector('main'),
+  ];
+  for (const el of candidates) {
+    if (!el || !(el.scrollTop > best)) continue;
+    best = el.scrollTop;
+  }
+  return best;
+}
+
+/** Lenis / Locomotive often translate a wrapper instead of changing scrollTop. */
+function findTransformScrollY() {
+  const candidates = [
+    document.querySelector('[data-scroll-container]'),
+    document.querySelector('.lenis'),
+    document.querySelector('[data-engine="locomotive"]'),
+    document.body,
+  ];
+  let best = 0;
+  for (const el of candidates) {
+    if (!el) continue;
+    const t = window.getComputedStyle(el).transform;
+    if (!t || t === 'none') continue;
+    // matrix(a,b,c,d,tx,ty) or matrix3d(..., ty at index 13)
+    const nums = t.match(/-?\d+\.?\d*/g);
+    if (!nums) continue;
+    let ty = 0;
+    if (t.startsWith('matrix3d') && nums.length >= 14) {
+      ty = Math.abs(parseFloat(nums[13]));
+    } else if (nums.length >= 6) {
+      ty = Math.abs(parseFloat(nums[5]));
+    }
+    if (ty > best) best = ty;
+  }
+  return best;
 }
 
 function applyLatticeBackground(host, dataUrl) {
