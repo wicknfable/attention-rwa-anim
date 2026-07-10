@@ -150,11 +150,14 @@ export const Theme = {
     // After freeze: wait for in-flight extrusions to finish rising, then bake.
     settleMs: 1800,
     // Pause when page scroll progress reaches this fraction (0–1).
-    // 0.2 = 20% of (document height − viewport). Set null/false to disable.
+    // 0.2 = 20% of scrollable document height. Set null/false to disable.
     scrollPauseAt: 0.20,
     // If true, scrolling back above the threshold resumes the animation.
     // If false, once paused by scroll it stays stopped until occupancy bake.
     scrollResume: true,
+    // When scroll-paused, hide the host so an absolute/fixed hero layer
+    // cannot show through lower-z-index sections further down the page.
+    hideWhenScrollPaused: true,
   },
 
   // ---- Runtime performance (fixed absolute background) --------------------
