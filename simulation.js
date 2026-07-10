@@ -282,8 +282,14 @@ export class Simulation {
     if (this._freezeRequested) {
       this._updateSurfaceAnimations(dt);
       this._settleTimerMs += dt;
-      const settleMs = Theme.lifecycle?.settleMs ?? 1500;
-      if (this._allSurfacesSettled() && this._settleTimerMs >= settleMs) {
+      const settleMs = Theme.lifecycle?.settleMs ?? 1200;
+      // Hard cap so a stuck mid-animation never blocks the bake forever.
+      const maxSettle = settleMs + 2500;
+      if (
+        (this._allSurfacesSettled() && this._settleTimerMs >= settleMs) ||
+        this._settleTimerMs >= maxSettle
+      ) {
+        this._snapSurfacesToDone();
         this.frozen = true;
         this.signals = [];
       }
@@ -299,6 +305,9 @@ export class Simulation {
       this._checkPlatformLifetimes();
     }
 
+    // Time-based freeze must be checked every frame (not only on the 400ms tick).
+    this._maybeRequestFreeze();
+
     this._occupancyTimerMs += dt;
     if (this._occupancyTimerMs >= 400) {
       this._occupancyTimerMs = 0;
@@ -306,7 +315,6 @@ export class Simulation {
         this._manageWorldOccupancy();
       }
       this._retryDeferredCompletions();
-      this._maybeRequestFreeze();
     }
 
     // Primary cleanup: trails die after trailTtlMs unless pinning a platform.
@@ -342,12 +350,16 @@ export class Simulation {
     if (!life || life.oneWay === false) return;
     if (this._freezeRequested || this.frozen) return;
 
+    const liveMs = life.liveDurationMs;
+    const timedOut = liveMs != null && this._simTimeMs >= Number(liveMs);
+
     const occupancy = this._computeOccupancy();
     const cells = this.completedCells.size;
-    const atOcc = occupancy >= (life.freezeOccupancy ?? 0.35);
-    const atCells = cells >= (life.freezeAtCells ?? 28);
+    const atOcc = occupancy >= (life.freezeOccupancy ?? 0.40);
+    const atCells = cells >= (life.freezeAtCells ?? 80);
 
-    if (atOcc || atCells) {
+    // Time is the primary client-demo trigger; occupancy is a backup.
+    if (timedOut || atOcc || atCells) {
       this._freezeRequested = true;
       this._settleTimerMs = 0;
       this.signals = [];
@@ -359,6 +371,16 @@ export class Simulation {
       if (cell.phase !== 'done') return false;
     }
     return true;
+  }
+
+  /** Force any mid-animation platforms to their final pose before bake. */
+  _snapSurfacesToDone() {
+    for (const cell of this.completedCells.values()) {
+      if (cell.phase === 'done') continue;
+      cell.surfaceProgress = 1;
+      cell.extrusionProgress = 1;
+      cell.phase = 'done';
+    }
   }
 
   /**
