@@ -103,10 +103,10 @@ export const Theme = {
 
   // ---- Signal spawning schedule ------------------------------------------
   spawn: {
-    minIntervalMs: 3200,
-    maxIntervalMs: 5800,
-    // Hard cap — never spawn above this (prevents unbounded signal growth).
-    maxConcurrent: 2,
+    minIntervalMs: 1800,
+    maxIntervalMs: 3200,
+    // Slightly more concurrent while building — animation is short-lived.
+    maxConcurrent: 3,
   },
 
 
@@ -126,26 +126,35 @@ export const Theme = {
   world: {
     // Working lattice radius — signals, activation, and occupancy stay inside.
     activeCellRadius: 7,
+    // Soft targets kept for reference; one-way mode freezes instead of collapsing.
     minOccupancy: 0.22,
     maxOccupancy: 0.35,
-    // Hard ceiling on simultaneous platforms — fewer = much smoother.
-    maxCompletedCells: 12,
-    // Each completed platform lives 3–5 s before deconstruction begins.
+    // Ceiling while building toward freeze (must be high enough to hit freezeOccupancy).
+    maxCompletedCells: 80,
+    // Unused in one-way mode (platforms never deconstruct).
     lifetimeMinMs: 3000,
     lifetimeMaxMs: 5000,
-    // Fallback prune (TTL expiry is the primary cleanup).
     edgePruneIntervalMs: 800,
-    // Absolute ceiling on remembered activated edges (draw + GC budget).
-    maxActivatedEdges: 48,
+    maxActivatedEdges: 64,
+  },
+
+  // ---- One-shot lifecycle (client showcase / fixed background) ------------
+  // Construction only — no deconstruction. Animate until fill target, then
+  // freeze forever as a baked static image (zero ongoing CPU).
+  lifecycle: {
+    oneWay: true,
+    // Freeze when this fraction of working-radius cells are platforms.
+    freezeOccupancy: 0.35,
+    // Backup cell count (~35% of radius-7 grid ≈ 225 cells).
+    freezeAtCells: 70,
+    // After freeze: wait for in-flight extrusions to finish rising, then bake.
+    settleMs: 1800,
   },
 
   // ---- Runtime performance (fixed absolute background) --------------------
   performance: {
-    // 30 FPS is plenty for this ambient layer and halves CPU/GPU work.
     targetFps: 30,
-    // Skip drawing lattice nodes (dots) — edges carry the visual language.
     drawLatticeNodes: false,
-    // Signal trail subdivisions.
     signalSubdivs: 2,
   },
 
